@@ -443,13 +443,17 @@ class StrongAugment(nn.Module):
         self.std = torch.tensor([0.2675, 0.2565, 0.2761]).view(1, 3, 1, 1)
 
     @torch.amp.autocast('cuda', enabled=False)
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, shared_affine: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, dict]:
         """Apply random augmentation to normalized images.
 
         Args:
             x: [B, 3, 32, 32] normalized images
+            shared_affine: Optional [B, 2, 3] pre-computed affine matrix to apply
+                          (for sharing affine between views)
         Returns:
-            [B, 3, 32, 32] augmented normalized images
+            Tuple of:
+                - [B, 3, 32, 32] augmented normalized images
+                - dict with transform info: {'flip': [B] bool, 'affine': [B, 2, 3] or None}
         """
         # Ensure float32 for augmentation operations
         x = x.float()
@@ -463,53 +467,69 @@ class StrongAugment(nn.Module):
         # Denormalize first
         x = x * std + mean  # [0, 1] range
 
+        affine_theta = None  # Will store affine if applied
+
         # ============================================================
-        # 1. SPATIAL AUGMENTATIONS (per-view independent!)
+        # 1. SPATIAL AUGMENTATIONS
         # ============================================================
 
-        # 1a. Random Horizontal Flip (50% chance per sample)
+        # 1a. Random Horizontal Flip (per-view independent, tracked)
         flip_mask = torch.rand(B, device=device) < 0.5
         if flip_mask.any():
             x[flip_mask] = x[flip_mask].flip(-1)  # flip width dimension
 
-        # 1b. Random Affine (50% chance per sample)
-        # - rotation: -15 to +15 degrees
-        # - translation: up to 10%
-        # - scale: 0.9 to 1.1
-        affine_mask = torch.rand(B, device=device) < 0.5
-        if affine_mask.any():
-            x_affine = x[affine_mask]
-            B_affine = x_affine.shape[0]
+        # 1b. Affine Transform (shared between views OR random if first call)
+        if shared_affine is not None:
+            # Use the shared affine from the other view
+            affine_theta = shared_affine
+            grid = F.affine_grid(affine_theta, x.shape, align_corners=False)
+            x = F.grid_sample(x, grid, mode='bilinear',
+                              padding_mode='reflection', align_corners=False)
+        else:
+            # First view: generate random affine (50% chance per sample)
+            affine_mask = torch.rand(B, device=device) < 0.5
+            if affine_mask.any():
+                # Build affine for samples that need it
+                B_affine = affine_mask.sum().item()
 
-            # Random rotation angles
-            angles = (torch.rand(B_affine, device=device) - 0.5) * 30  # -15 to +15 degrees
-            angles_rad = angles * (torch.pi / 180.0)
+                # Random rotation angles
+                angles = (torch.rand(B_affine, device=device) - 0.5) * 30  # -15 to +15 degrees
+                angles_rad = angles * (torch.pi / 180.0)
 
-            # Random scale
-            scales = 0.9 + torch.rand(B_affine, device=device) * 0.2  # 0.9 to 1.1
+                # Random scale
+                scales = 0.9 + torch.rand(B_affine, device=device) * 0.2  # 0.9 to 1.1
 
-            # Random translation (in normalized coords, -1 to 1)
-            tx = (torch.rand(B_affine, device=device) - 0.5) * 0.2  # -0.1 to 0.1
-            ty = (torch.rand(B_affine, device=device) - 0.5) * 0.2
+                # Random translation (in normalized coords, -1 to 1)
+                tx = (torch.rand(B_affine, device=device) - 0.5) * 0.2  # -0.1 to 0.1
+                ty = (torch.rand(B_affine, device=device) - 0.5) * 0.2
 
-            # Build affine matrix [B, 2, 3]
-            cos_a = torch.cos(angles_rad)
-            sin_a = torch.sin(angles_rad)
+                # Build affine matrix [B_affine, 2, 3]
+                cos_a = torch.cos(angles_rad)
+                sin_a = torch.sin(angles_rad)
 
-            # Rotation + Scale matrix
-            theta = torch.zeros(B_affine, 2, 3, device=device)
-            theta[:, 0, 0] = cos_a * scales
-            theta[:, 0, 1] = -sin_a * scales
-            theta[:, 0, 2] = tx
-            theta[:, 1, 0] = sin_a * scales
-            theta[:, 1, 1] = cos_a * scales
-            theta[:, 1, 2] = ty
+                theta_partial = torch.zeros(B_affine, 2, 3, device=device)
+                theta_partial[:, 0, 0] = cos_a * scales
+                theta_partial[:, 0, 1] = -sin_a * scales
+                theta_partial[:, 0, 2] = tx
+                theta_partial[:, 1, 0] = sin_a * scales
+                theta_partial[:, 1, 1] = cos_a * scales
+                theta_partial[:, 1, 2] = ty
 
-            # Apply affine transform
-            grid = F.affine_grid(theta, x_affine.shape, align_corners=False)
-            x_affine = F.grid_sample(x_affine, grid, mode='bilinear',
-                                      padding_mode='reflection', align_corners=False)
-            x[affine_mask] = x_affine
+                # Build full theta for all samples (identity for non-affine)
+                affine_theta = torch.zeros(B, 2, 3, device=device)
+                affine_theta[:, 0, 0] = 1.0
+                affine_theta[:, 1, 1] = 1.0
+                affine_theta[affine_mask] = theta_partial
+
+                # Apply affine transform to all (identity for non-affine samples)
+                grid = F.affine_grid(affine_theta, x.shape, align_corners=False)
+                x = F.grid_sample(x, grid, mode='bilinear',
+                                  padding_mode='reflection', align_corners=False)
+
+        transform_info = {
+            'flip': flip_mask,  # [B] bool - only flip varies between views
+            'affine': affine_theta,  # [B, 2, 3] or None - shared between views
+        }
 
         # ============================================================
         # 2. COLOR AUGMENTATIONS
@@ -564,7 +584,7 @@ class StrongAugment(nn.Module):
         x = x.clamp(0, 1)
         x = (x - mean) / std
 
-        return x
+        return x, transform_info
 
 
 class VAREncoderCIFAR(nn.Module):
@@ -701,6 +721,52 @@ class VAREncoderCIFAR(nn.Module):
         x = x.permute(0, 2, 3, 1).view(B, to_grid * to_grid, D)  # [B, to_grid^2, D]
         return x
 
+    def compute_flip_correspondence(
+        self,
+        flip1: torch.Tensor,
+        flip2: torch.Tensor,
+        grid_size: int,
+    ) -> torch.Tensor:
+        """Compute token correspondence based on flip difference between views.
+
+        Since affine is shared, only flip differs between views.
+        If both views have same flip status → identity mapping
+        If flip status differs → horizontal flip mapping
+
+        Args:
+            flip1: [B] bool - whether view1 was flipped
+            flip2: [B] bool - whether view2 was flipped
+            grid_size: grid size (2 for S1, 4 for S2, 8 for S3)
+
+        Returns:
+            correspondence: [B, N] indices mapping view1 tokens to view2 tokens
+        """
+        B = flip1.shape[0]
+        device = flip1.device
+        N = grid_size * grid_size
+
+        # Create identity mapping [0, 1, 2, ..., N-1]
+        identity = torch.arange(N, device=device).unsqueeze(0).expand(B, -1)  # [B, N]
+
+        # Create horizontal flip mapping
+        # For grid_size=2: [0,1,2,3] -> [1,0,3,2] (flip columns within each row)
+        # For grid_size=4: [0,1,2,3,4,5,...] -> [3,2,1,0,7,6,5,4,...]
+        flip_map = torch.arange(N, device=device).view(grid_size, grid_size)
+        flip_map = flip_map.flip(1).flatten()  # Flip columns
+        flip_map = flip_map.unsqueeze(0).expand(B, -1)  # [B, N]
+
+        # XOR: need to flip correspondence only if exactly one view was flipped
+        need_flip = flip1 ^ flip2  # [B] bool
+
+        # Select between identity and flip mapping
+        correspondence = torch.where(
+            need_flip.unsqueeze(1).expand(-1, N),
+            flip_map,
+            identity
+        )  # [B, N]
+
+        return correspondence
+
     def forward(self, images: torch.Tensor) -> dict:
         """
         Args:
@@ -712,38 +778,46 @@ class VAREncoderCIFAR(nn.Module):
         B = images.shape[0]
 
         # Two augmented views from same image
-        view1 = self.augment(images)
-        view2 = self.augment(images)
+        # - Affine is shared (applied identically to both views)
+        # - Flip is independent (different per view, tracked for correspondence)
+        view1, t1 = self.augment(images)  # First view generates affine
+        view2, t2 = self.augment(images, shared_affine=t1['affine'])  # Second view reuses affine
 
         # Encode both views (shared weights)
         h1 = self.encode_all_scales(view1)  # dict: {cls, s1, s2, s3}
         h2 = self.encode_all_scales(view2)  # dict: {cls, s1, s2, s3}
 
         # ============================================================
-        # 1. CLS-CLS SimCLR Loss (global representation alignment)
+        # 1. CLS-CLS SimCLR Loss (global representation - spatial invariance)
         # ============================================================
         loss_cls = self.infonce_cls(h1['cls'], h2['cls'])
 
         # ============================================================
-        # 2. Cross-view Hierarchical Loss with Spatial Matching
+        # 2. Cross-view Hierarchical Loss with Flip Correspondence
         # ============================================================
+        # Since affine is shared, only flip differs between views
+        # Compute flip correspondence for each scale
+        corr_s1 = self.compute_flip_correspondence(t1['flip'], t2['flip'], grid_size=2)
+        corr_s2 = self.compute_flip_correspondence(t1['flip'], t2['flip'], grid_size=4)
+
         # S1 (2x2=4) predicts S2 (4x4=16) pooled to (2x2=4)
         # S2 (4x4=16) predicts S3 (8x8=64) pooled to (4x4=16)
 
-        # v1 coarse → v2 fine (pooled)
+        # v1 coarse → v2 fine (pooled) with correspondence
         h2_s2_pooled = self.spatial_pool(h2['s2'], from_grid=4, to_grid=2)  # [B, 4, dim]
         h2_s3_pooled = self.spatial_pool(h2['s3'], from_grid=8, to_grid=4)  # [B, 16, dim]
-        loss_12_s1s2 = self.infonce_spatial(h1['s1'], h2_s2_pooled)  # [B, 4, dim] vs [B, 4, dim]
-        loss_12_s2s3 = self.infonce_spatial(h1['s2'], h2_s3_pooled)  # [B, 16, dim] vs [B, 16, dim]
+        loss_12_s1s2 = self.infonce_spatial_aligned(h1['s1'], h2_s2_pooled, corr_s1)
+        loss_12_s2s3 = self.infonce_spatial_aligned(h1['s2'], h2_s3_pooled, corr_s2)
 
-        # v2 coarse → v1 fine (pooled)
+        # v2 coarse → v1 fine (pooled) - reverse correspondence (same as forward for flip)
+        # Note: flip correspondence is symmetric, so corr(v1→v2) == corr(v2→v1)
         h1_s2_pooled = self.spatial_pool(h1['s2'], from_grid=4, to_grid=2)  # [B, 4, dim]
         h1_s3_pooled = self.spatial_pool(h1['s3'], from_grid=8, to_grid=4)  # [B, 16, dim]
-        loss_21_s1s2 = self.infonce_spatial(h2['s1'], h1_s2_pooled)
-        loss_21_s2s3 = self.infonce_spatial(h2['s2'], h1_s3_pooled)
+        loss_21_s1s2 = self.infonce_spatial_aligned(h2['s1'], h1_s2_pooled, corr_s1)
+        loss_21_s2s3 = self.infonce_spatial_aligned(h2['s2'], h1_s3_pooled, corr_s2)
 
-        loss_hier = (loss_12_s1s2 + loss_12_s2s3 + loss_21_s1s2 + loss_21_s2s3) / 4
-
+        # loss_hier = (loss_12_s1s2 + loss_12_s2s3 + loss_21_s1s2 + loss_21_s2s3) / 4
+        loss_hier = (loss_12_s1s2 + loss_12_s2s3) / 4
         # ============================================================
         # 3. Combined Loss
         # ============================================================
@@ -813,6 +887,49 @@ class VAREncoderCIFAR(nn.Module):
         # logits[i, j] = similarity between pred[i] and target[j]
         logits = pred_norm @ target_norm.T / tau  # [B*N, B*N]
         labels = torch.arange(B * N, device=logits.device)
+
+        return F.cross_entropy(logits, labels)
+
+    def infonce_spatial_aligned(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        correspondence: torch.Tensor,
+    ) -> torch.Tensor:
+        """Spatial InfoNCE with flip-aware correspondence.
+
+        Instead of assuming pred[i] matches target[i], we use the computed
+        correspondence to match tokens that represent the same spatial location
+        in the original image (accounting for flip differences).
+
+        Args:
+            pred: [B, N, dim] - source tokens from view1
+            target: [B, N, dim] - target tokens from view2 (pooled)
+            correspondence: [B, N] - for each pred token, which target token it corresponds to
+        Returns:
+            scalar loss
+        """
+        B, N, D = pred.shape
+        tau = self.config.temperature
+        device = pred.device
+
+        # Gather corresponding targets using correspondence mapping
+        # target_aligned[b, n] = target[b, correspondence[b, n]]
+        batch_indices = torch.arange(B, device=device).unsqueeze(1).expand(-1, N)  # [B, N]
+        target_aligned = target[batch_indices, correspondence]  # [B, N, dim]
+
+        # Flatten for InfoNCE
+        pred_flat = pred.reshape(B * N, D)  # [B*N, dim]
+        target_flat = target_aligned.reshape(B * N, D)  # [B*N, dim]
+
+        # Project pred only (asymmetry)
+        pred_proj = self.predictor(pred_flat)
+        pred_norm = F.normalize(pred_proj, dim=-1)
+        target_norm = F.normalize(target_flat.detach(), dim=-1)
+
+        # InfoNCE: each position matches its corresponding position
+        logits = pred_norm @ target_norm.T / tau  # [B*N, B*N]
+        labels = torch.arange(B * N, device=device)
 
         return F.cross_entropy(logits, labels)
 
