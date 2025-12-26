@@ -5,24 +5,24 @@ Architecture:
 - Input: [CLS, S1_real, S2_real, S3_real] (ALL real embeddings!)
 - Two augmented views from same image
 - Cross-View Prediction:
-  - view1의 S1 → view2의 S2 예측 (coarse → fine)
-  - view1의 S2 → view2의 S3 예측 (coarse → fine)
-  - 반대 방향도 동일하게
+- view1의 S1 → view2의 S2 예측 (coarse → fine)
+- view1의 S2 → view2의 S3 예측 (coarse → fine)
+- 반대 방향도 동일하게
 
 Attention Mask (all scales independent):
-             CLS │ S1(4) │ S2(16) │ S3(64)
-            ─────┼───────┼────────┼────────
-       CLS │  ✓  │   ✗   │   ✗    │   ✓     ← CLS sees CLS + S3 only
-       S1  │  ✓  │   ✓   │   ✗    │   ✗     ← S1 sees CLS + S1 only
-       S2  │  ✓  │   ✗   │   ✓    │   ✗     ← S2 sees CLS + S2 only
-       S3  │  ✓  │   ✗   │   ✗    │   ✓     ← S3 sees CLS + S3 only
+CLS │ S1(4) │ S2(16) │ S3(64)
+─────┼───────┼────────┼────────
+CLS │ ✓ │ ✗ │ ✗ │ ✓ ← CLS sees CLS + S3 only
+S1 │ ✓ │ ✓ │ ✗ │ ✗ ← S1 sees CLS + S1 only
+S2 │ ✓ │ ✗ │ ✓ │ ✗ ← S2 sees CLS + S2 only
+S3 │ ✓ │ ✗ │ ✗ │ ✓ ← S3 sees CLS + S3 only
 
 Key Insight:
-  - 모든 스케일이 독립적: 각 스케일은 CLS + 자기 자신만 참조
-  - CLS/S3는 CLS+S3만 참조 → 인퍼런스시 CLS+S3만 필요 (65 tokens)
-  - S1/S2는 훈련시에만 사용 (hierarchical loss 계산용)
-  - 다른 augmentation → low-level shortcut 방지
-  - Color, blur, crop이 달라 → semantic만 남음
+- 모든 스케일이 독립적: 각 스케일은 CLS + 자기 자신만 참조
+- CLS/S3는 CLS+S3만 참조 → 인퍼런스시 CLS+S3만 필요 (65 tokens)
+- S1/S2는 훈련시에만 사용 (hierarchical loss 계산용)
+- 다른 augmentation → low-level shortcut 방지
+- Color, blur, crop이 달라 → semantic만 남음
 
 Scales for 32x32 images (4x4 patches):
 - Scale 1: 8x8 → 2x2 grid → 4 tokens
@@ -31,7 +31,7 @@ Scales for 32x32 images (4x4 patches):
 Total: 84 tokens + CLS = 85 tokens (training), 65 tokens (inference)
 
 Usage:
-    python scripts/poc_cifar.py
+python scripts/poc_cifar.py
 """
 
 import torch
@@ -49,6 +49,7 @@ from dataclasses import dataclass
 from typing import Optional, List, Tuple
 from functools import lru_cache
 import os
+import random
 
 
 # ============================================================
@@ -82,15 +83,21 @@ class CIFARConfig:
     use_wandb: bool = True
     project: str = "vare-poc"
 
+    # Reproducibility
+    seed: int = 42
+
+    # Augmentation
+    spatial_match: bool = True  # True: 두 뷰 같은 spatial aug, False: 독립적 (불일치)
+
 
 # ============================================================
 # Scale configs for CIFAR (32x32)
 # ============================================================
 
 CIFAR_SCALE_CONFIGS = [
-    (8, 2, 4),     # Scale 1: 8x8 → 2x2 = 4 tokens
-    (16, 4, 16),   # Scale 2: 16x16 → 4x4 = 16 tokens
-    (32, 8, 64),   # Scale 3: 32x32 → 8x8 = 64 tokens
+    (8, 2, 4),    # Scale 1: 8x8 → 2x2 = 4 tokens
+    (16, 4, 16),  # Scale 2: 16x16 → 4x4 = 16 tokens
+    (32, 8, 64),  # Scale 3: 32x32 → 8x8 = 64 tokens
 ]
 
 CIFAR_NUM_SCALES = len(CIFAR_SCALE_CONFIGS)
@@ -112,17 +119,17 @@ def build_causal_mask(device: str = 'cpu') -> torch.Tensor:
     """Build causal mask with CLS/S3 only seeing CLS+S3.
 
     Mask structure (85 x 85):
-             CLS │ S1(4) │ S2(16) │ S3(64)
-            ─────┼───────┼────────┼────────
-       CLS │  ✓  │   ✗   │   ✗    │   ✓     ← CLS sees CLS + S3 only
-       S1  │  ✓  │   ✓   │   ✗    │   ✗     ← S1 sees CLS + S1 only
-       S2  │  ✓  │   ✗   │   ✓    │   ✗     ← S2 sees CLS + S2 only
-       S3  │  ✓  │   ✗   │   ✗    │   ✓     ← S3 sees CLS + S3 only
+    CLS │ S1(4) │ S2(16) │ S3(64)
+    ─────┼───────┼────────┼────────
+    CLS │ ✓ │ ✗ │ ✗ │ ✓ ← CLS sees CLS + S3 only
+    S1 │ ✓ │ ✓ │ ✗ │ ✗ ← S1 sees CLS + S1 only
+    S2 │ ✓ │ ✗ │ ✓ │ ✗ ← S2 sees CLS + S2 only
+    S3 │ ✓ │ ✗ │ ✗ │ ✓ ← S3 sees CLS + S3 only
 
     Key Insight:
-        - All scales are independent: each sees only CLS + itself
-        - CLS and S3 are self-contained → inference needs only CLS + S3 (65 tokens)
-        - S1, S2 are training-only for hierarchical loss
+    - All scales are independent: each sees only CLS + itself
+    - CLS and S3 are self-contained → inference needs only CLS + S3 (65 tokens)
+    - S1, S2 are training-only for hierarchical loss
     """
     total = CIFAR_TOTAL_TOKENS
     mask = torch.full((total, total), float('-inf'))
@@ -160,10 +167,10 @@ def build_fast_mask(device: str = 'cpu') -> torch.Tensor:
     """Build mask for fast inference (CLS + S3 only = 65 tokens).
 
     Mask structure (65 x 65):
-             CLS │ S3(64)
-            ─────┼────────
-       CLS │  ✓  │   ✓     ← CLS sees CLS + S3
-       S3  │  ✓  │   ✓     ← S3 sees CLS + S3
+    CLS │ S3(64)
+    ─────┼────────
+    CLS │ ✓ │ ✓ ← CLS sees CLS + S3
+    S3 │ ✓ │ ✓ ← S3 sees CLS + S3
 
     Full bidirectional attention within CLS+S3.
     """
@@ -370,7 +377,8 @@ class Block(nn.Module):
 class StrongAugment(nn.Module):
     """DINO/BYOL-style strong augmentation for cross-view prediction.
 
-    Includes both spatial and color augmentations for each view independently.
+    Includes both spatial and color augmentations.
+    Can apply them separately for spatial_match mode.
     """
 
     def __init__(self):
@@ -379,58 +387,37 @@ class StrongAugment(nn.Module):
         self.mean = torch.tensor([0.5071, 0.4867, 0.4408]).view(1, 3, 1, 1)
         self.std = torch.tensor([0.2675, 0.2565, 0.2761]).view(1, 3, 1, 1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply random augmentation to normalized images.
+    def spatial_augment(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply spatial augmentations only (flip, affine).
 
         Args:
-            x: [B, 3, 32, 32] normalized images
+            x: [B, 3, 32, 32] in [0, 1] range
         Returns:
-            [B, 3, 32, 32] augmented normalized images
+            [B, 3, 32, 32] spatially augmented
         """
-        B, C, H, W = x.shape
+        B = x.shape[0]
         device = x.device
-
-        # Move mean/std to device
-        mean = self.mean.to(device)
-        std = self.std.to(device)
-
-        # Denormalize first
-        x = x * std + mean  # [0, 1] range
-
-        # ============================================================
-        # 1. SPATIAL AUGMENTATIONS (per-view independent!)
-        # ============================================================
 
         # 1a. Random Horizontal Flip (50% chance per sample)
         flip_mask = torch.rand(B, device=device) < 0.5
         if flip_mask.any():
-            x[flip_mask] = x[flip_mask].flip(-1)  # flip width dimension
+            x[flip_mask] = x[flip_mask].flip(-1)
 
         # 1b. Random Affine (50% chance per sample)
-        # - rotation: -15 to +15 degrees
-        # - translation: up to 10%
-        # - scale: 0.9 to 1.1
         affine_mask = torch.rand(B, device=device) < 0.5
         if affine_mask.any():
             x_affine = x[affine_mask]
             B_affine = x_affine.shape[0]
 
-            # Random rotation angles
-            angles = (torch.rand(B_affine, device=device) - 0.5) * 30  # -15 to +15 degrees
+            angles = (torch.rand(B_affine, device=device) - 0.5) * 30
             angles_rad = angles * (torch.pi / 180.0)
-
-            # Random scale
-            scales = 0.9 + torch.rand(B_affine, device=device) * 0.2  # 0.9 to 1.1
-
-            # Random translation (in normalized coords, -1 to 1)
-            tx = (torch.rand(B_affine, device=device) - 0.5) * 0.2  # -0.1 to 0.1
+            scales = 0.9 + torch.rand(B_affine, device=device) * 0.2
+            tx = (torch.rand(B_affine, device=device) - 0.5) * 0.2
             ty = (torch.rand(B_affine, device=device) - 0.5) * 0.2
 
-            # Build affine matrix [B, 2, 3]
             cos_a = torch.cos(angles_rad)
             sin_a = torch.sin(angles_rad)
 
-            # Rotation + Scale matrix
             theta = torch.zeros(B_affine, 2, 3, device=device)
             theta[:, 0, 0] = cos_a * scales
             theta[:, 0, 1] = -sin_a * scales
@@ -439,43 +426,50 @@ class StrongAugment(nn.Module):
             theta[:, 1, 1] = cos_a * scales
             theta[:, 1, 2] = ty
 
-            # Apply affine transform
             grid = F.affine_grid(theta, x_affine.shape, align_corners=False)
             x_affine = F.grid_sample(x_affine, grid, mode='bilinear',
-                                      padding_mode='reflection', align_corners=False)
+                                     padding_mode='reflection', align_corners=False)
             x[affine_mask] = x_affine
 
-        # ============================================================
-        # 2. COLOR AUGMENTATIONS
-        # ============================================================
+        return x
 
-        # 2a. Color Jitter (per-sample random)
+    def color_augment(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply color augmentations only.
+
+        Args:
+            x: [B, 3, 32, 32] in [0, 1] range
+        Returns:
+            [B, 3, 32, 32] color augmented
+        """
+        B = x.shape[0]
+        device = x.device
+
         # Brightness
-        brightness = 1.0 + (torch.rand(B, 1, 1, 1, device=device) - 0.5) * 0.8  # [0.6, 1.4]
+        brightness = 1.0 + (torch.rand(B, 1, 1, 1, device=device) - 0.5) * 0.8
         x = x * brightness
 
         # Contrast
         gray = x.mean(dim=1, keepdim=True)
-        contrast = 1.0 + (torch.rand(B, 1, 1, 1, device=device) - 0.5) * 0.8  # [0.6, 1.4]
+        contrast = 1.0 + (torch.rand(B, 1, 1, 1, device=device) - 0.5) * 0.8
         x = gray + (x - gray) * contrast
 
         # Saturation
         gray = x.mean(dim=1, keepdim=True)
-        saturation = 1.0 + (torch.rand(B, 1, 1, 1, device=device) - 0.5) * 0.8  # [0.6, 1.4]
+        saturation = 1.0 + (torch.rand(B, 1, 1, 1, device=device) - 0.5) * 0.8
         x = gray + (x - gray) * saturation
 
-        # Hue shift (simplified - just rotate channels slightly)
+        # Hue shift
         hue_mask = torch.rand(B, device=device) < 0.5
         if hue_mask.any():
             x[hue_mask] = x[hue_mask][:, [2, 1, 0], :, :]
 
-        # 2b. Random Grayscale (20% chance)
+        # Random Grayscale (20%)
         gray_mask = torch.rand(B, device=device) < 0.2
         if gray_mask.any():
             gray_val = x[gray_mask].mean(dim=1, keepdim=True)
             x[gray_mask] = gray_val.expand(-1, 3, -1, -1)
 
-        # 2c. Gaussian Blur (50% chance) - simple 3x3 averaging
+        # Gaussian Blur (50%)
         blur_mask = torch.rand(B, device=device) < 0.5
         if blur_mask.any():
             kernel = torch.ones(3, 1, 3, 3, device=device) / 9.0
@@ -486,13 +480,37 @@ class StrongAugment(nn.Module):
             )
             x[blur_mask] = blurred
 
-        # 2d. Random Solarize (10% chance)
+        # Random Solarize (10%)
         solar_mask = torch.rand(B, device=device) < 0.1
         if solar_mask.any():
             threshold = 0.5
             inverted = 1.0 - x[solar_mask]
             high_mask = x[solar_mask] > threshold
             x[solar_mask] = torch.where(high_mask, inverted, x[solar_mask])
+
+        return x
+
+    def forward(self, x: torch.Tensor, spatial_only: bool = False, color_only: bool = False) -> torch.Tensor:
+        """Apply augmentations to normalized images.
+
+        Args:
+            x: [B, 3, 32, 32] normalized images
+            spatial_only: apply only spatial augmentations
+            color_only: apply only color augmentations
+        Returns:
+            [B, 3, 32, 32] augmented normalized images
+        """
+        device = x.device
+        mean = self.mean.to(device)
+        std = self.std.to(device)
+
+        # Denormalize first
+        x = x * std + mean  # [0, 1] range
+
+        if not color_only:
+            x = self.spatial_augment(x)
+        if not spatial_only:
+            x = self.color_augment(x)
 
         # Clamp and renormalize
         x = x.clamp(0, 1)
@@ -505,17 +523,17 @@ class VAREncoderCIFAR(nn.Module):
     """VAR-Encoder for CIFAR-100 with Cross-View Prediction.
 
     Architecture:
-        Input: [CLS, S1_real, S2_real, S3_real] (ALL real embeddings!)
-        Two augmented views from same image
-        Cross-View Prediction:
-            - view1의 S1 → view2의 S2 예측 (coarse → fine)
-            - view1의 S2 → view2의 S3 예측 (coarse → fine)
-            - 반대 방향도 동일하게
+    Input: [CLS, S1_real, S2_real, S3_real] (ALL real embeddings!)
+    Two augmented views from same image
+    Cross-View Prediction:
+    - view1의 S1 → view2의 S2 예측 (coarse → fine)
+    - view1의 S2 → view2의 S3 예측 (coarse → fine)
+    - 반대 방향도 동일하게
 
     Key insight:
-        - 다른 augmentation → low-level shortcut 방지
-        - Color, blur, crop이 달라 → semantic만 남음
-        - DINO/BYOL과 유사한 검증된 방법
+    - 다른 augmentation → low-level shortcut 방지
+    - Color, blur, crop이 달라 → semantic만 남음
+    - DINO/BYOL과 유사한 검증된 방법
     """
 
     def __init__(self, config: CIFARConfig):
@@ -604,10 +622,10 @@ class VAREncoderCIFAR(nn.Module):
 
         # Extract hidden states for each scale
         return {
-            'cls': hidden[:, 0],           # [B, dim]
-            's1': hidden[:, 1:5],          # [B, 4, dim]
-            's2': hidden[:, 5:21],         # [B, 16, dim]
-            's3': hidden[:, 21:85],        # [B, 64, dim]
+            'cls': hidden[:, 0],      # [B, dim]
+            's1': hidden[:, 1:5],     # [B, 4, dim]
+            's2': hidden[:, 5:21],    # [B, 16, dim]
+            's3': hidden[:, 21:85],   # [B, 64, dim]
         }
 
     def spatial_pool(self, x: torch.Tensor, from_grid: int, to_grid: int) -> torch.Tensor:
@@ -645,8 +663,15 @@ class VAREncoderCIFAR(nn.Module):
         B = images.shape[0]
 
         # Two augmented views from same image
-        view1 = self.augment(images)
-        view2 = self.augment(images)
+        if self.config.spatial_match:
+            # 일치 모드: 같은 spatial aug → 다른 color aug만
+            shared_spatial = self.augment(images, spatial_only=True)
+            view1 = self.augment(shared_spatial, color_only=True)
+            view2 = self.augment(shared_spatial, color_only=True)
+        else:
+            # 불일치 모드: 각 뷰 독립적 spatial + color
+            view1 = self.augment(images)
+            view2 = self.augment(images)
 
         # Encode both views (shared weights)
         h1 = self.encode_all_scales(view1)  # dict: {cls, s1, s2, s3}
@@ -954,12 +979,12 @@ def visualize_attention(model, test_loader, device, save_path='attention.png', n
     """DINO-style attention visualization with per-head breakdown.
 
     Layout:
-        Row 0: Original images
-        Row 1: Head 0 attention
-        Row 2: Head 1 attention
-        ...
-        Row H: Head H-1 attention
-        Row H+1: Mean attention (all heads)
+    Row 0: Original images
+    Row 1: Head 0 attention
+    Row 2: Head 1 attention
+    ...
+    Row H: Head H-1 attention
+    Row H+1: Mean attention (all heads)
     """
     model.eval()
 
@@ -1077,36 +1102,57 @@ def full_evaluation(model, train_loader, test_loader, device, output_dir='output
 # Main
 # ============================================================
 
+def set_seed(seed: int):
+    """Set random seed for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
 def main():
     config = CIFARConfig()
+
+    # Set seed for reproducibility
+    set_seed(config.seed)
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     print("=" * 60)
     print("VAR-Encoder CIFAR-100 PoC (Cross-View Prediction)")
     print("=" * 60)
     print(f"Device: {device}")
+    print(f"Seed: {config.seed}")
+    print(f"Spatial Match: {config.spatial_match} ({'일치' if config.spatial_match else '불일치'})")
     print(f"Scales: {CIFAR_SCALE_CONFIGS}")
     print(f"Total tokens: {CIFAR_TOTAL_TOKENS} (CLS + {CIFAR_TOTAL_PATCH_TOKENS} patches)")
 
     boundaries = get_scale_boundaries()
     print(f"\nArchitecture:")
-    print(f"  Input: [CLS, S1_real, S2_real, S3_real] (ALL real embeddings!)")
-    print(f"  Attention Mask (all scales independent):")
-    print(f"    CLS [{boundaries[0]}:{boundaries[1]}] → sees CLS + S3 only")
-    print(f"    S1 [{boundaries[1]}:{boundaries[2]}] → sees CLS + S1 only")
-    print(f"    S2 [{boundaries[2]}:{boundaries[3]}] → sees CLS + S2 only")
-    print(f"    S3 [{boundaries[3]}:{boundaries[4]}] → sees CLS + S3 only")
-    print(f"  Fast Inference:")
-    print(f"    CLS + S3 only (65 tokens instead of 85)")
-    print(f"    S1, S2 are training-only for hierarchical loss")
-    print(f"  Cross-View Prediction:")
-    print(f"    view1 = augment(image)")
-    print(f"    view2 = augment(image)  # different random augmentation")
-    print(f"    h1_S1 → h2_S2 (InfoNCE)  # v1 coarse → v2 fine")
-    print(f"    h1_S2 → h2_S3 (InfoNCE)")
-    print(f"    h2_S1 → h1_S2 (InfoNCE)  # reverse direction")
-    print(f"    h2_S2 → h1_S3 (InfoNCE)")
-    print(f"  Temperature: {config.temperature}")
+    print(f" Input: [CLS, S1_real, S2_real, S3_real] (ALL real embeddings!)")
+    print(f" Attention Mask (all scales independent):")
+    print(f" CLS [{boundaries[0]}:{boundaries[1]}] → sees CLS + S3 only")
+    print(f" S1 [{boundaries[1]}:{boundaries[2]}] → sees CLS + S1 only")
+    print(f" S2 [{boundaries[2]}:{boundaries[3]}] → sees CLS + S2 only")
+    print(f" S3 [{boundaries[3]}:{boundaries[4]}] → sees CLS + S3 only")
+    print(f" Fast Inference:")
+    print(f" CLS + S3 only (65 tokens instead of 85)")
+    print(f" S1, S2 are training-only for hierarchical loss")
+    print(f" Cross-View Prediction (spatial_match={config.spatial_match}):")
+    if config.spatial_match:
+        print(f"  shared_spatial = spatial_aug(image)")
+        print(f"  view1 = color_aug(shared_spatial)")
+        print(f"  view2 = color_aug(shared_spatial)  # 같은 spatial, 다른 color")
+    else:
+        print(f"  view1 = augment(image)  # 독립적 spatial + color")
+        print(f"  view2 = augment(image)  # 독립적 spatial + color")
+    print(f" h1_S1 → h2_S2 (InfoNCE) # v1 coarse → v2 fine")
+    print(f" h1_S2 → h2_S3 (InfoNCE)")
+    print(f" h2_S1 → h1_S2 (InfoNCE) # reverse direction")
+    print(f" h2_S2 → h1_S3 (InfoNCE)")
+    print(f" Temperature: {config.temperature}")
 
     # Model
     model = VAREncoderCIFAR(config).to(device)
@@ -1157,19 +1203,19 @@ def main():
             if last_knn > best_knn:
                 best_knn = last_knn
 
-            # Visualizations
-            epoch_dir = f'outputs/epoch{epoch}'
-            os.makedirs(epoch_dir, exist_ok=True)
-            visualize_tsne(model, test_loader, device,
-                           save_path=f'{epoch_dir}/tsne.png')
-            visualize_attention(model, test_loader, device,
-                                save_path=f'{epoch_dir}/attention.png')
+        # Visualizations
+        epoch_dir = f'outputs/epoch{epoch}'
+        os.makedirs(epoch_dir, exist_ok=True)
+        visualize_tsne(model, test_loader, device,
+                       save_path=f'{epoch_dir}/tsne.png')
+        visualize_attention(model, test_loader, device,
+                            save_path=f'{epoch_dir}/attention.png')
 
-            if config.use_wandb:
-                wandb.log({
-                    'viz/tsne': wandb.Image(f'{epoch_dir}/tsne.png'),
-                    'viz/attention': wandb.Image(f'{epoch_dir}/attention.png'),
-                })
+        if config.use_wandb:
+            wandb.log({
+                'viz/tsne': wandb.Image(f'{epoch_dir}/tsne.png'),
+                'viz/attention': wandb.Image(f'{epoch_dir}/attention.png'),
+            })
 
         knn_str = f"knn={last_knn*100:.2f}%" if knn_evaluated else f"knn={last_knn*100:.2f}% (cached)"
         print(f"Epoch {epoch}: loss={train_stats['loss']:.4f} (cls={train_stats['loss_cls']:.3f}, hier={train_stats['loss_hier']:.3f}), test={test_loss:.4f}, {knn_str}")
@@ -1189,7 +1235,7 @@ def main():
         if test_loss < best_loss:
             best_loss = test_loss
             torch.save(model.state_dict(), 'best_model_cifar.pt')
-            print(f"  → Best model saved! (loss={best_loss:.4f})")
+            print(f" → Best model saved! (loss={best_loss:.4f})")
 
     # Final evaluation
     print("\n" + "=" * 60)
