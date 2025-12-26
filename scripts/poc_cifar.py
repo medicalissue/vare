@@ -86,7 +86,8 @@ class CIFARConfig:
     # Reproducibility
     seed: int = 42
 
-    # Correspondence tracking
+    # Loss settings
+    use_cls_loss: bool = False  # False: disable CLS-CLS contrastive loss
     use_correspondence: bool = True  # False: position-wise without tracking
 
     # Attention mask matrix (4x4: cls, s1, s2, s3)
@@ -690,7 +691,10 @@ class VAREncoderCIFAR(nn.Module):
         # ============================================================
         # 1. CLS-CLS SimCLR Loss (global representation alignment)
         # ============================================================
-        loss_cls = self.infonce_cls(h1['cls'], h2['cls'])
+        if self.config.use_cls_loss:
+            loss_cls = self.infonce_cls(h1['cls'], h2['cls'])
+        else:
+            loss_cls = torch.tensor(0.0, device=h1['cls'].device)
 
         # ============================================================
         # 2. Cross-view Hierarchical Loss
@@ -723,12 +727,14 @@ class VAREncoderCIFAR(nn.Module):
         # ============================================================
         # 3. Combined Loss
         # ============================================================
-        # CLS loss weight: 0.5, Hierarchical loss weight: 0.5
-        loss = 0.5 * loss_cls + 0.5 * loss_hier
+        if self.config.use_cls_loss:
+            loss = 0.5 * loss_cls + 0.5 * loss_hier
+        else:
+            loss = loss_hier
 
         return {
             'loss': loss,
-            'loss_cls': loss_cls.item(),
+            'loss_cls': loss_cls.item() if self.config.use_cls_loss else 0.0,
             'loss_hier': loss_hier.item(),
             'cls': h1['cls'],
         }
