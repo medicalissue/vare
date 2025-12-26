@@ -100,7 +100,10 @@ class CIFARConfig:
     #   - S3 sees CLS + S3
     # 1 = attend, 0 = mask out. None = use default mask.
     custom_attn_mask: Optional[List[List[int]]] = field(
-        default_factory=lambda: [[1,0,0,1], [1,1,0,0], [1,0,1,0], [1,0,0,1]]
+        default_factory=lambda: [[1,0,0,1],
+                                 [1,1,0,0],
+                                 [0,1,1,0],
+                                 [1,0,0,1]]
     )
 
 
