@@ -652,8 +652,8 @@ class VAREncoderCIFAR(nn.Module):
         view2, params2 = self.augment(images.clone(), return_params=True)
 
         # Encode both views (shared weights)
-        h1 = self.encode_all_scales(view1)  # dict: {cls, s1, s2, s3}
-        h2 = self.encode_all_scales(view2)  # dict: {cls, s1, s2, s3}
+        h1 = self.encode_all_scales(view1)
+        h2 = self.encode_all_scales(view2)
 
         # ============================================================
         # 1. CLS-CLS SimCLR Loss (global representation alignment)
