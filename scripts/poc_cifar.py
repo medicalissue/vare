@@ -86,9 +86,6 @@ class CIFARConfig:
     # Reproducibility
     seed: int = 42
 
-    # Augmentation
-    spatial_match: bool = True  # True: 두 뷰 같은 spatial aug, False: 독립적 (불일치)
-
 
 # ============================================================
 # Scale configs for CIFAR (32x32)
@@ -387,51 +384,30 @@ class StrongAugment(nn.Module):
         self.mean = torch.tensor([0.5071, 0.4867, 0.4408]).view(1, 3, 1, 1)
         self.std = torch.tensor([0.2675, 0.2565, 0.2761]).view(1, 3, 1, 1)
 
-    def spatial_augment(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply spatial augmentations only (flip, affine).
+    def spatial_augment_with_params(self, x: torch.Tensor) -> Tuple[torch.Tensor, dict]:
+        """Apply spatial augmentations and return parameters for correspondence.
 
         Args:
             x: [B, 3, 32, 32] in [0, 1] range
         Returns:
-            [B, 3, 32, 32] spatially augmented
+            augmented: [B, 3, 32, 32] spatially augmented
+            params: dict with 'flip_mask' for correspondence tracking
         """
         B = x.shape[0]
         device = x.device
 
-        # 1a. Random Horizontal Flip (50% chance per sample)
+        # Random Horizontal Flip (50% chance per sample)
         flip_mask = torch.rand(B, device=device) < 0.5
         if flip_mask.any():
             x[flip_mask] = x[flip_mask].flip(-1)
 
-        # 1b. Random Affine (50% chance per sample)
-        affine_mask = torch.rand(B, device=device) < 0.5
-        if affine_mask.any():
-            x_affine = x[affine_mask]
-            B_affine = x_affine.shape[0]
+        params = {'flip_mask': flip_mask}  # [B] bool
+        return x, params
 
-            angles = (torch.rand(B_affine, device=device) - 0.5) * 30
-            angles_rad = angles * (torch.pi / 180.0)
-            scales = 0.9 + torch.rand(B_affine, device=device) * 0.2
-            tx = (torch.rand(B_affine, device=device) - 0.5) * 0.2
-            ty = (torch.rand(B_affine, device=device) - 0.5) * 0.2
-
-            cos_a = torch.cos(angles_rad)
-            sin_a = torch.sin(angles_rad)
-
-            theta = torch.zeros(B_affine, 2, 3, device=device)
-            theta[:, 0, 0] = cos_a * scales
-            theta[:, 0, 1] = -sin_a * scales
-            theta[:, 0, 2] = tx
-            theta[:, 1, 0] = sin_a * scales
-            theta[:, 1, 1] = cos_a * scales
-            theta[:, 1, 2] = ty
-
-            grid = F.affine_grid(theta, x_affine.shape, align_corners=False)
-            x_affine = F.grid_sample(x_affine, grid, mode='bilinear',
-                                     padding_mode='reflection', align_corners=False)
-            x[affine_mask] = x_affine
-
-        return x
+    def spatial_augment(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply spatial augmentations only (flip)."""
+        augmented, _ = self.spatial_augment_with_params(x)
+        return augmented
 
     def color_augment(self, x: torch.Tensor) -> torch.Tensor:
         """Apply color augmentations only.
@@ -490,15 +466,18 @@ class StrongAugment(nn.Module):
 
         return x
 
-    def forward(self, x: torch.Tensor, spatial_only: bool = False, color_only: bool = False) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, spatial_only: bool = False,
+                color_only: bool = False, return_params: bool = False):
         """Apply augmentations to normalized images.
 
         Args:
             x: [B, 3, 32, 32] normalized images
             spatial_only: apply only spatial augmentations
             color_only: apply only color augmentations
+            return_params: return spatial augmentation params for correspondence
         Returns:
-            [B, 3, 32, 32] augmented normalized images
+            if return_params: (augmented, params)
+            else: augmented
         """
         device = x.device
         mean = self.mean.to(device)
@@ -507,8 +486,12 @@ class StrongAugment(nn.Module):
         # Denormalize first
         x = x * std + mean  # [0, 1] range
 
+        params = None
         if not color_only:
-            x = self.spatial_augment(x)
+            if return_params:
+                x, params = self.spatial_augment_with_params(x)
+            else:
+                x = self.spatial_augment(x)
         if not spatial_only:
             x = self.color_augment(x)
 
@@ -516,6 +499,8 @@ class StrongAugment(nn.Module):
         x = x.clamp(0, 1)
         x = (x - mean) / std
 
+        if return_params:
+            return x, params
         return x
 
 
@@ -662,16 +647,9 @@ class VAREncoderCIFAR(nn.Module):
         """
         B = images.shape[0]
 
-        # Two augmented views from same image
-        if self.config.spatial_match:
-            # 일치 모드: 같은 spatial aug → 다른 color aug만
-            shared_spatial = self.augment(images, spatial_only=True)
-            view1 = self.augment(shared_spatial, color_only=True)
-            view2 = self.augment(shared_spatial, color_only=True)
-        else:
-            # 불일치 모드: 각 뷰 독립적 spatial + color
-            view1 = self.augment(images)
-            view2 = self.augment(images)
+        # Two augmented views with correspondence tracking
+        view1, params1 = self.augment(images.clone(), return_params=True)
+        view2, params2 = self.augment(images.clone(), return_params=True)
 
         # Encode both views (shared weights)
         h1 = self.encode_all_scales(view1)  # dict: {cls, s1, s2, s3}
@@ -683,22 +661,26 @@ class VAREncoderCIFAR(nn.Module):
         loss_cls = self.infonce_cls(h1['cls'], h2['cls'])
 
         # ============================================================
-        # 2. Cross-view Hierarchical Loss with Spatial Matching
+        # 2. Cross-view Hierarchical Loss with Correspondence Tracking
         # ============================================================
-        # S1 (2x2=4) predicts S2 (4x4=16) pooled to (2x2=4)
-        # S2 (4x4=16) predicts S3 (8x8=64) pooled to (4x4=16)
+        # Compute correspondences for each scale (after pooling)
+        # S1: 2x2 grid, S2: 4x4 grid
+        corr_s1 = self.compute_correspondence(params1, params2, grid_size=2)  # [B, 4]
+        corr_s2 = self.compute_correspondence(params1, params2, grid_size=4)  # [B, 16]
+        corr_s1_rev = self.compute_correspondence(params2, params1, grid_size=2)
+        corr_s2_rev = self.compute_correspondence(params2, params1, grid_size=4)
 
-        # v1 coarse → v2 fine (pooled)
+        # v1 coarse → v2 fine (pooled) with correspondence
         h2_s2_pooled = self.spatial_pool(h2['s2'], from_grid=4, to_grid=2)  # [B, 4, dim]
         h2_s3_pooled = self.spatial_pool(h2['s3'], from_grid=8, to_grid=4)  # [B, 16, dim]
-        loss_12_s1s2 = self.infonce_spatial(h1['s1'], h2_s2_pooled)  # [B, 4, dim] vs [B, 4, dim]
-        loss_12_s2s3 = self.infonce_spatial(h1['s2'], h2_s3_pooled)  # [B, 16, dim] vs [B, 16, dim]
+        loss_12_s1s2 = self.infonce_spatial_with_correspondence(h1['s1'], h2_s2_pooled, corr_s1)
+        loss_12_s2s3 = self.infonce_spatial_with_correspondence(h1['s2'], h2_s3_pooled, corr_s2)
 
-        # v2 coarse → v1 fine (pooled)
+        # v2 coarse → v1 fine (pooled) with correspondence
         h1_s2_pooled = self.spatial_pool(h1['s2'], from_grid=4, to_grid=2)  # [B, 4, dim]
         h1_s3_pooled = self.spatial_pool(h1['s3'], from_grid=8, to_grid=4)  # [B, 16, dim]
-        loss_21_s1s2 = self.infonce_spatial(h2['s1'], h1_s2_pooled)
-        loss_21_s2s3 = self.infonce_spatial(h2['s2'], h1_s3_pooled)
+        loss_21_s1s2 = self.infonce_spatial_with_correspondence(h2['s1'], h1_s2_pooled, corr_s1_rev)
+        loss_21_s2s3 = self.infonce_spatial_with_correspondence(h2['s2'], h1_s3_pooled, corr_s2_rev)
 
         loss_hier = (loss_12_s1s2 + loss_12_s2s3 + loss_21_s1s2 + loss_21_s2s3) / 4
 
@@ -770,6 +752,79 @@ class VAREncoderCIFAR(nn.Module):
         # InfoNCE: each position matches its corresponding position
         # logits[i, j] = similarity between pred[i] and target[j]
         logits = pred_norm @ target_norm.T / tau  # [B*N, B*N]
+        labels = torch.arange(B * N, device=logits.device)
+
+        return F.cross_entropy(logits, labels)
+
+    def compute_correspondence(self, params1: dict, params2: dict, grid_size: int) -> torch.Tensor:
+        """Compute token correspondence between two views (flip only).
+
+        For horizontal flip:
+        - Token at column j maps to column (grid_size - 1 - j) when flipped
+        - XOR logic: flip1 XOR flip2 determines if positions differ
+
+        Args:
+            params1: {'flip_mask': [B]} from view1
+            params2: {'flip_mask': [B]} from view2
+            grid_size: grid size (e.g., 2 for S1, 4 for S2)
+        Returns:
+            correspondence: [B, grid_size^2] indices into view2 tokens
+        """
+        B = params1['flip_mask'].shape[0]
+        device = params1['flip_mask'].device
+        N = grid_size * grid_size
+
+        # Base indices (identity mapping)
+        # Token index = row * grid_size + col
+        base_idx = torch.arange(N, device=device).unsqueeze(0).expand(B, -1)  # [B, N]
+
+        # Flipped indices: for each token, compute horizontally flipped position
+        # row stays same, col -> (grid_size - 1 - col)
+        rows = base_idx // grid_size  # [B, N]
+        cols = base_idx % grid_size   # [B, N]
+        flipped_cols = grid_size - 1 - cols
+        flipped_idx = rows * grid_size + flipped_cols  # [B, N]
+
+        # XOR: need to flip correspondence if exactly one view is flipped
+        need_flip = params1['flip_mask'] ^ params2['flip_mask']  # [B]
+
+        # Select based on need_flip
+        correspondence = torch.where(
+            need_flip.unsqueeze(1).expand(-1, N),
+            flipped_idx,
+            base_idx
+        )
+
+        return correspondence
+
+    def infonce_spatial_with_correspondence(self, pred: torch.Tensor, target: torch.Tensor,
+                                            correspondence: torch.Tensor) -> torch.Tensor:
+        """Spatial-aware InfoNCE with correspondence tracking.
+
+        Args:
+            pred: [B, N, dim] - source tokens
+            target: [B, N, dim] - target tokens
+            correspondence: [B, N] - indices mapping pred positions to target positions
+        Returns:
+            scalar loss
+        """
+        B, N, D = pred.shape
+        tau = self.config.temperature
+
+        # Reorder target according to correspondence
+        # target_reordered[b, i] = target[b, correspondence[b, i]]
+        batch_idx = torch.arange(B, device=pred.device).unsqueeze(1).expand(-1, N)
+        target_reordered = target[batch_idx, correspondence]  # [B, N, dim]
+
+        # Now use standard position-wise InfoNCE
+        pred_flat = pred.reshape(B * N, D)
+        target_flat = target_reordered.reshape(B * N, D)
+
+        pred_proj = self.predictor(pred_flat)
+        pred_norm = F.normalize(pred_proj, dim=-1)
+        target_norm = F.normalize(target_flat.detach(), dim=-1)
+
+        logits = pred_norm @ target_norm.T / tau
         labels = torch.arange(B * N, device=logits.device)
 
         return F.cross_entropy(logits, labels)
@@ -1125,7 +1180,6 @@ def main():
     print("=" * 60)
     print(f"Device: {device}")
     print(f"Seed: {config.seed}")
-    print(f"Spatial Match: {config.spatial_match} ({'일치' if config.spatial_match else '불일치'})")
     print(f"Scales: {CIFAR_SCALE_CONFIGS}")
     print(f"Total tokens: {CIFAR_TOTAL_TOKENS} (CLS + {CIFAR_TOTAL_PATCH_TOKENS} patches)")
 
@@ -1140,18 +1194,14 @@ def main():
     print(f" Fast Inference:")
     print(f" CLS + S3 only (65 tokens instead of 85)")
     print(f" S1, S2 are training-only for hierarchical loss")
-    print(f" Cross-View Prediction (spatial_match={config.spatial_match}):")
-    if config.spatial_match:
-        print(f"  shared_spatial = spatial_aug(image)")
-        print(f"  view1 = color_aug(shared_spatial)")
-        print(f"  view2 = color_aug(shared_spatial)  # 같은 spatial, 다른 color")
-    else:
-        print(f"  view1 = augment(image)  # 독립적 spatial + color")
-        print(f"  view2 = augment(image)  # 독립적 spatial + color")
-    print(f" h1_S1 → h2_S2 (InfoNCE) # v1 coarse → v2 fine")
-    print(f" h1_S2 → h2_S3 (InfoNCE)")
-    print(f" h2_S1 → h1_S2 (InfoNCE) # reverse direction")
-    print(f" h2_S2 → h1_S3 (InfoNCE)")
+    print(f" Cross-View Prediction (with Correspondence Tracking):")
+    print(f"  view1, params1 = augment(image)  # 독립적 spatial + color")
+    print(f"  view2, params2 = augment(image)  # 독립적 spatial + color")
+    print(f"  corr = compute_correspondence(params1, params2)  # 공간 매핑")
+    print(f"  h1_S1 → h2_S2[corr] (InfoNCE)  # 올바른 위치끼리 매칭")
+    print(f"  h1_S2 → h2_S3[corr] (InfoNCE)")
+    print(f"  h2_S1 → h1_S2[corr] (InfoNCE)  # reverse direction")
+    print(f"  h2_S2 → h1_S3[corr] (InfoNCE)")
     print(f" Temperature: {config.temperature}")
 
     # Model
@@ -1203,19 +1253,20 @@ def main():
             if last_knn > best_knn:
                 best_knn = last_knn
 
-        # Visualizations
-        epoch_dir = f'outputs/epoch{epoch}'
-        os.makedirs(epoch_dir, exist_ok=True)
-        visualize_tsne(model, test_loader, device,
-                       save_path=f'{epoch_dir}/tsne.png')
-        visualize_attention(model, test_loader, device,
-                            save_path=f'{epoch_dir}/attention.png')
+        # Visualizations (every 10 epochs)
+        if epoch % 10 == 0 or epoch == 1:
+            epoch_dir = f'outputs/epoch{epoch}'
+            os.makedirs(epoch_dir, exist_ok=True)
+            visualize_tsne(model, test_loader, device,
+                           save_path=f'{epoch_dir}/tsne.png')
+            visualize_attention(model, test_loader, device,
+                                save_path=f'{epoch_dir}/attention.png')
 
-        if config.use_wandb:
-            wandb.log({
-                'viz/tsne': wandb.Image(f'{epoch_dir}/tsne.png'),
-                'viz/attention': wandb.Image(f'{epoch_dir}/attention.png'),
-            })
+            if config.use_wandb:
+                wandb.log({
+                    'viz/tsne': wandb.Image(f'{epoch_dir}/tsne.png'),
+                    'viz/attention': wandb.Image(f'{epoch_dir}/attention.png'),
+                })
 
         knn_str = f"knn={last_knn*100:.2f}%" if knn_evaluated else f"knn={last_knn*100:.2f}% (cached)"
         print(f"Epoch {epoch}: loss={train_stats['loss']:.4f} (cls={train_stats['loss_cls']:.3f}, hier={train_stats['loss_hier']:.3f}), test={test_loss:.4f}, {knn_str}")
