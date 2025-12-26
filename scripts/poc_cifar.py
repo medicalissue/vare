@@ -103,11 +103,15 @@ class CIFARConfig:
         default_factory=lambda: [[1,0,0,1],
                                  [1,1,0,0],
                                  [0,1,1,0],
-                                 [1,0,0,1]]
+                                 [0,0,0,1]]
     )
 
     # Loss options
-    use_cls_loss: bool = True  # Enable/disable CLS-CLS SimCLR loss
+    use_cls_loss: bool = False  # Enable/disable CLS-CLS SimCLR loss
+    use_s3_cls_loss: bool = True  # Enable/disable S3 → CLS prediction loss
+
+    # Pooling type for spatial pooling ('mean' or 'max')
+    pool_type: str = 'mean'
 
 
 # ============================================================
@@ -211,7 +215,7 @@ def build_causal_mask(device: str = 'cpu', custom_mask: Optional[List[List[int]]
         [1, 0, 0, 1],  # CLS sees CLS + S3
         [1, 1, 0, 0],  # S1 sees CLS + S1
         [1, 0, 1, 0],  # S2 sees CLS + S2
-        [1, 0, 0, 1],  # S3 sees CLS + S3
+        [0, 0, 0, 1],  # S3 sees CLS + S3
     ]
     mask = build_causal_mask_from_matrix(default_matrix, device)
     _default_mask_cache[device] = mask
@@ -734,13 +738,29 @@ class VAREncoderCIFAR(nn.Module):
         # Reshape to 2D grid
         x = x.view(B, from_grid, from_grid, D).permute(0, 3, 1, 2)  # [B, D, H, W]
 
-        # Pool down
+        # Pool down using configured pool type
         pool_size = from_grid // to_grid
-        x = F.avg_pool2d(x, kernel_size=pool_size, stride=pool_size)  # [B, D, to_grid, to_grid]
+        if self.config.pool_type == 'max':
+            x = F.max_pool2d(x, kernel_size=pool_size, stride=pool_size)
+        else:  # mean
+            x = F.avg_pool2d(x, kernel_size=pool_size, stride=pool_size)  # [B, D, to_grid, to_grid]
 
         # Reshape back
         x = x.permute(0, 2, 3, 1).view(B, to_grid * to_grid, D)  # [B, to_grid^2, D]
         return x
+
+    def global_pool(self, x: torch.Tensor) -> torch.Tensor:
+        """Pool all tokens to a single vector.
+
+        Args:
+            x: [B, N, dim] - spatial tokens
+        Returns:
+            [B, dim] - pooled representation
+        """
+        if self.config.pool_type == 'max':
+            return x.max(dim=1)[0]
+        else:  # mean
+            return x.mean(dim=1)
 
     def compute_flip_correspondence(
         self,
@@ -843,20 +863,40 @@ class VAREncoderCIFAR(nn.Module):
 
         # loss_hier = (loss_12_s1s2 + loss_12_s2s3 + loss_21_s1s2 + loss_21_s2s3) / 4
         loss_hier = (loss_12_s1s2 + loss_12_s2s3) / 2
+
         # ============================================================
-        # 3. Combined Loss
+        # 3. S3 → CLS Prediction Loss (fine → global)
         # ============================================================
-        if self.config.use_cls_loss:
-            # CLS loss weight: 0.5, Hierarchical loss weight: 0.5
-            loss = 0.5 * loss_cls + 0.5 * loss_hier
+        if self.config.use_s3_cls_loss:
+            # Pool S3 to single vector and predict the other view's CLS
+            h1_s3_global = self.global_pool(h1['s3'])  # [B, dim]
+            h2_s3_global = self.global_pool(h2['s3'])  # [B, dim]
+            # Cross-view: S3 from view1 → CLS from view2, and vice versa
+            # loss_s3_cls = (self.infonce_cls(h1_s3_global, h2['cls']) +
+            #                self.infonce_cls(h2_s3_global, h1['cls'])) / 2
+            loss_s3_cls = self.infonce_cls(h1_s3_global, h2['cls'])
         else:
-            # Only hierarchical loss
-            loss = loss_hier
+            loss_s3_cls = torch.tensor(0.0, device=images.device)
+
+        # ============================================================
+        # 4. Combined Loss
+        # ============================================================
+        # Count active losses for weighting
+        active_losses = []
+        if self.config.use_cls_loss:
+            active_losses.append(loss_cls)
+        active_losses.append(loss_hier)  # Always active
+        if self.config.use_s3_cls_loss:
+            active_losses.append(loss_s3_cls)
+
+        # Equal weight for all active losses
+        loss = sum(active_losses) / len(active_losses)
 
         return {
             'loss': loss,
-            'loss_cls': loss_cls.item(),
+            'loss_cls': loss_cls.item() if self.config.use_cls_loss else 0.0,
             'loss_hier': loss_hier.item(),
+            'loss_s3_cls': loss_s3_cls.item() if self.config.use_s3_cls_loss else 0.0,
             'cls': h1['cls'],
         }
 
@@ -1042,6 +1082,7 @@ def train_epoch(model, loader, optimizer, device, epoch, base_seed: Optional[int
     total_loss = 0
     total_loss_cls = 0
     total_loss_hier = 0
+    total_loss_s3_cls = 0
 
     # Set epoch-specific seed for reproducibility with diversity
     if base_seed is not None:
@@ -1072,10 +1113,12 @@ def train_epoch(model, loader, optimizer, device, epoch, base_seed: Optional[int
         total_loss += loss.item()
         total_loss_cls += output['loss_cls']
         total_loss_hier += output['loss_hier']
+        total_loss_s3_cls += output['loss_s3_cls']
         pbar.set_postfix(
             loss=f"{loss.item():.3f}",
             cls=f"{output['loss_cls']:.3f}",
-            hier=f"{output['loss_hier']:.3f}"
+            hier=f"{output['loss_hier']:.3f}",
+            s3c=f"{output['loss_s3_cls']:.3f}"
         )
 
     n = len(loader)
@@ -1083,6 +1126,7 @@ def train_epoch(model, loader, optimizer, device, epoch, base_seed: Optional[int
         'loss': total_loss / n,
         'loss_cls': total_loss_cls / n,
         'loss_hier': total_loss_hier / n,
+        'loss_s3_cls': total_loss_s3_cls / n,
     }
 
 
@@ -1456,13 +1500,14 @@ def main():
                 })
 
         knn_str = f"knn={last_knn*100:.2f}%" if knn_evaluated else f"knn={last_knn*100:.2f}% (cached)"
-        print(f"Epoch {epoch}: loss={train_stats['loss']:.4f} (cls={train_stats['loss_cls']:.3f}, hier={train_stats['loss_hier']:.3f}), test={test_loss:.4f}, {knn_str}")
+        print(f"Epoch {epoch}: loss={train_stats['loss']:.4f} (cls={train_stats['loss_cls']:.3f}, hier={train_stats['loss_hier']:.3f}, s3c={train_stats['loss_s3_cls']:.3f}), test={test_loss:.4f}, {knn_str}")
 
         if config.use_wandb:
             log_dict = {
                 'train/loss': train_stats['loss'],
                 'train/loss_cls': train_stats['loss_cls'],
                 'train/loss_hier': train_stats['loss_hier'],
+                'train/loss_s3_cls': train_stats['loss_s3_cls'],
                 'test/loss': test_loss,
                 'lr': scheduler.get_last_lr()[0],
             }
