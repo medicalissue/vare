@@ -443,13 +443,15 @@ class StrongAugment(nn.Module):
         self.std = torch.tensor([0.2675, 0.2565, 0.2761]).view(1, 3, 1, 1)
 
     @torch.amp.autocast('cuda', enabled=False)
-    def forward(self, x: torch.Tensor, shared_affine: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, dict]:
+    def forward(self, x: torch.Tensor, shared_affine: Optional[torch.Tensor] = None,
+                apply_crop: bool = False) -> Tuple[torch.Tensor, dict]:
         """Apply random augmentation to normalized images.
 
         Args:
             x: [B, 3, 32, 32] normalized images
             shared_affine: Optional [B, 2, 3] pre-computed affine matrix to apply
                           (for sharing affine between views)
+            apply_crop: If True, apply random crop (only for view1)
         Returns:
             Tuple of:
                 - [B, 3, 32, 32] augmented normalized images
@@ -473,7 +475,23 @@ class StrongAugment(nn.Module):
         # 1. SPATIAL AUGMENTATIONS
         # ============================================================
 
-        # 1a. Random Horizontal Flip (per-view independent, tracked)
+        # 1a. Random Crop (only for view1)
+        if apply_crop:
+            crop_ratio = 0.8
+            crop_size = int(H * crop_ratio)  # 25 for CIFAR (32 * 0.8)
+            # Per-sample random crop
+            max_offset = H - crop_size
+            top = torch.randint(0, max_offset + 1, (B,), device=device)
+            left = torch.randint(0, max_offset + 1, (B,), device=device)
+            # Apply crop and resize back for each sample
+            cropped = []
+            for i in range(B):
+                crop = x[i:i+1, :, top[i]:top[i]+crop_size, left[i]:left[i]+crop_size]
+                crop_resized = F.interpolate(crop, size=(H, W), mode='bilinear', align_corners=False)
+                cropped.append(crop_resized)
+            x = torch.cat(cropped, dim=0)
+
+        # 1b. Random Horizontal Flip (per-view independent, tracked)
         flip_mask = torch.rand(B, device=device) < 0.5
         if flip_mask.any():
             x[flip_mask] = x[flip_mask].flip(-1)  # flip width dimension
@@ -778,10 +796,11 @@ class VAREncoderCIFAR(nn.Module):
         B = images.shape[0]
 
         # Two augmented views from same image
+        # - Random crop is applied only to view1
         # - Affine is shared (applied identically to both views)
         # - Flip is independent (different per view, tracked for correspondence)
-        view1, t1 = self.augment(images)  # First view generates affine
-        view2, t2 = self.augment(images, shared_affine=t1['affine'])  # Second view reuses affine
+        view1, t1 = self.augment(images, apply_crop=True)  # First view: crop + generates affine
+        view2, t2 = self.augment(images, shared_affine=t1['affine'])  # Second view: no crop, reuses affine
 
         # Encode both views (shared weights)
         h1 = self.encode_all_scales(view1)  # dict: {cls, s1, s2, s3}
@@ -817,7 +836,7 @@ class VAREncoderCIFAR(nn.Module):
         loss_21_s2s3 = self.infonce_spatial_aligned(h2['s2'], h1_s3_pooled, corr_s2)
 
         # loss_hier = (loss_12_s1s2 + loss_12_s2s3 + loss_21_s1s2 + loss_21_s2s3) / 4
-        loss_hier = (loss_12_s1s2 + loss_12_s2s3) / 4
+        loss_hier = (loss_12_s1s2 + loss_12_s2s3) / 2
         # ============================================================
         # 3. Combined Loss
         # ============================================================
