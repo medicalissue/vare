@@ -5,24 +5,24 @@ Architecture:
 - Input: [CLS, S1_real, S2_real, S3_real] (ALL real embeddings!)
 - Two augmented views from same image
 - Cross-View Prediction:
-- view1의 S1 → view2의 S2 예측 (coarse → fine)
-- view1의 S2 → view2의 S3 예측 (coarse → fine)
-- 반대 방향도 동일하게
+  - view1의 S1 → view2의 S2 예측 (coarse → fine)
+  - view1의 S2 → view2의 S3 예측 (coarse → fine)
+  - 반대 방향도 동일하게
 
 Attention Mask (all scales independent):
-CLS │ S1(4) │ S2(16) │ S3(64)
-─────┼───────┼────────┼────────
-CLS │ ✓ │ ✗ │ ✗ │ ✓ ← CLS sees CLS + S3 only
-S1 │ ✓ │ ✓ │ ✗ │ ✗ ← S1 sees CLS + S1 only
-S2 │ ✓ │ ✗ │ ✓ │ ✗ ← S2 sees CLS + S2 only
-S3 │ ✓ │ ✗ │ ✗ │ ✓ ← S3 sees CLS + S3 only
+             CLS │ S1(4) │ S2(16) │ S3(64)
+            ─────┼───────┼────────┼────────
+       CLS │  ✓  │   ✗   │   ✗    │   ✓     ← CLS sees CLS + S3 only
+       S1  │  ✓  │   ✓   │   ✗    │   ✗     ← S1 sees CLS + S1 only
+       S2  │  ✓  │   ✗   │   ✓    │   ✗     ← S2 sees CLS + S2 only
+       S3  │  ✓  │   ✗   │   ✗    │   ✓     ← S3 sees CLS + S3 only
 
 Key Insight:
-- 모든 스케일이 독립적: 각 스케일은 CLS + 자기 자신만 참조
-- CLS/S3는 CLS+S3만 참조 → 인퍼런스시 CLS+S3만 필요 (65 tokens)
-- S1/S2는 훈련시에만 사용 (hierarchical loss 계산용)
-- 다른 augmentation → low-level shortcut 방지
-- Color, blur, crop이 달라 → semantic만 남음
+  - 모든 스케일이 독립적: 각 스케일은 CLS + 자기 자신만 참조
+  - CLS/S3는 CLS+S3만 참조 → 인퍼런스시 CLS+S3만 필요 (65 tokens)
+  - S1/S2는 훈련시에만 사용 (hierarchical loss 계산용)
+  - 다른 augmentation → low-level shortcut 방지
+  - Color, blur, crop이 달라 → semantic만 남음
 
 Scales for 32x32 images (4x4 patches):
 - Scale 1: 8x8 → 2x2 grid → 4 tokens
@@ -31,7 +31,7 @@ Scales for 32x32 images (4x4 patches):
 Total: 84 tokens + CLS = 85 tokens (training), 65 tokens (inference)
 
 Usage:
-python scripts/poc_cifar.py
+    python scripts/poc_cifar.py
 """
 
 import torch
@@ -49,7 +49,6 @@ from dataclasses import dataclass
 from typing import Optional, List, Tuple
 from functools import lru_cache
 import os
-import random
 
 
 # ============================================================
@@ -83,18 +82,15 @@ class CIFARConfig:
     use_wandb: bool = True
     project: str = "vare-poc"
 
-    # Reproducibility
-    seed: int = 42
-
 
 # ============================================================
 # Scale configs for CIFAR (32x32)
 # ============================================================
 
 CIFAR_SCALE_CONFIGS = [
-    (8, 2, 4),    # Scale 1: 8x8 → 2x2 = 4 tokens
-    (16, 4, 16),  # Scale 2: 16x16 → 4x4 = 16 tokens
-    (32, 8, 64),  # Scale 3: 32x32 → 8x8 = 64 tokens
+    (8, 2, 4),     # Scale 1: 8x8 → 2x2 = 4 tokens
+    (16, 4, 16),   # Scale 2: 16x16 → 4x4 = 16 tokens
+    (32, 8, 64),   # Scale 3: 32x32 → 8x8 = 64 tokens
 ]
 
 CIFAR_NUM_SCALES = len(CIFAR_SCALE_CONFIGS)
@@ -116,17 +112,17 @@ def build_causal_mask(device: str = 'cpu') -> torch.Tensor:
     """Build causal mask with CLS/S3 only seeing CLS+S3.
 
     Mask structure (85 x 85):
-    CLS │ S1(4) │ S2(16) │ S3(64)
-    ─────┼───────┼────────┼────────
-    CLS │ ✓ │ ✗ │ ✗ │ ✓ ← CLS sees CLS + S3 only
-    S1 │ ✓ │ ✓ │ ✗ │ ✗ ← S1 sees CLS + S1 only
-    S2 │ ✓ │ ✗ │ ✓ │ ✗ ← S2 sees CLS + S2 only
-    S3 │ ✓ │ ✗ │ ✗ │ ✓ ← S3 sees CLS + S3 only
+             CLS │ S1(4) │ S2(16) │ S3(64)
+            ─────┼───────┼────────┼────────
+       CLS │  ✓  │   ✗   │   ✗    │   ✓     ← CLS sees CLS + S3 only
+       S1  │  ✓  │   ✓   │   ✗    │   ✗     ← S1 sees CLS + S1 only
+       S2  │  ✓  │   ✗   │   ✓    │   ✗     ← S2 sees CLS + S2 only
+       S3  │  ✓  │   ✗   │   ✗    │   ✓     ← S3 sees CLS + S3 only
 
     Key Insight:
-    - All scales are independent: each sees only CLS + itself
-    - CLS and S3 are self-contained → inference needs only CLS + S3 (65 tokens)
-    - S1, S2 are training-only for hierarchical loss
+        - All scales are independent: each sees only CLS + itself
+        - CLS and S3 are self-contained → inference needs only CLS + S3 (65 tokens)
+        - S1, S2 are training-only for hierarchical loss
     """
     total = CIFAR_TOTAL_TOKENS
     mask = torch.full((total, total), float('-inf'))
@@ -164,10 +160,10 @@ def build_fast_mask(device: str = 'cpu') -> torch.Tensor:
     """Build mask for fast inference (CLS + S3 only = 65 tokens).
 
     Mask structure (65 x 65):
-    CLS │ S3(64)
-    ─────┼────────
-    CLS │ ✓ │ ✓ ← CLS sees CLS + S3
-    S3 │ ✓ │ ✓ ← S3 sees CLS + S3
+             CLS │ S3(64)
+            ─────┼────────
+       CLS │  ✓  │   ✓     ← CLS sees CLS + S3
+       S3  │  ✓  │   ✓     ← S3 sees CLS + S3
 
     Full bidirectional attention within CLS+S3.
     """
@@ -374,8 +370,7 @@ class Block(nn.Module):
 class StrongAugment(nn.Module):
     """DINO/BYOL-style strong augmentation for cross-view prediction.
 
-    Includes both spatial and color augmentations.
-    Can apply them separately for spatial_match mode.
+    Includes both spatial and color augmentations for each view independently.
     """
 
     def __init__(self):
@@ -384,68 +379,103 @@ class StrongAugment(nn.Module):
         self.mean = torch.tensor([0.5071, 0.4867, 0.4408]).view(1, 3, 1, 1)
         self.std = torch.tensor([0.2675, 0.2565, 0.2761]).view(1, 3, 1, 1)
 
-    def spatial_augment_with_params(self, x: torch.Tensor) -> Tuple[torch.Tensor, dict]:
-        """Apply spatial augmentations and return parameters for correspondence.
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply random augmentation to normalized images.
 
         Args:
-            x: [B, 3, 32, 32] in [0, 1] range
+            x: [B, 3, 32, 32] normalized images
         Returns:
-            augmented: [B, 3, 32, 32] spatially augmented
-            params: dict with 'flip_mask' for correspondence tracking
+            [B, 3, 32, 32] augmented normalized images
         """
-        B = x.shape[0]
+        B, C, H, W = x.shape
         device = x.device
 
-        # Random Horizontal Flip (50% chance per sample)
+        # Move mean/std to device
+        mean = self.mean.to(device)
+        std = self.std.to(device)
+
+        # Denormalize first
+        x = x * std + mean  # [0, 1] range
+
+        # ============================================================
+        # 1. SPATIAL AUGMENTATIONS (per-view independent!)
+        # ============================================================
+
+        # 1a. Random Horizontal Flip (50% chance per sample)
         flip_mask = torch.rand(B, device=device) < 0.5
         if flip_mask.any():
-            x[flip_mask] = x[flip_mask].flip(-1)
+            x[flip_mask] = x[flip_mask].flip(-1)  # flip width dimension
 
-        params = {'flip_mask': flip_mask}  # [B] bool
-        return x, params
+        # 1b. Random Affine (50% chance per sample)
+        # - rotation: -15 to +15 degrees
+        # - translation: up to 10%
+        # - scale: 0.9 to 1.1
+        affine_mask = torch.rand(B, device=device) < 0.5
+        if affine_mask.any():
+            x_affine = x[affine_mask]
+            B_affine = x_affine.shape[0]
 
-    def spatial_augment(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply spatial augmentations only (flip)."""
-        augmented, _ = self.spatial_augment_with_params(x)
-        return augmented
+            # Random rotation angles
+            angles = (torch.rand(B_affine, device=device) - 0.5) * 30  # -15 to +15 degrees
+            angles_rad = angles * (torch.pi / 180.0)
 
-    def color_augment(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply color augmentations only.
+            # Random scale
+            scales = 0.9 + torch.rand(B_affine, device=device) * 0.2  # 0.9 to 1.1
 
-        Args:
-            x: [B, 3, 32, 32] in [0, 1] range
-        Returns:
-            [B, 3, 32, 32] color augmented
-        """
-        B = x.shape[0]
-        device = x.device
+            # Random translation (in normalized coords, -1 to 1)
+            tx = (torch.rand(B_affine, device=device) - 0.5) * 0.2  # -0.1 to 0.1
+            ty = (torch.rand(B_affine, device=device) - 0.5) * 0.2
 
+            # Build affine matrix [B, 2, 3]
+            cos_a = torch.cos(angles_rad)
+            sin_a = torch.sin(angles_rad)
+
+            # Rotation + Scale matrix
+            theta = torch.zeros(B_affine, 2, 3, device=device)
+            theta[:, 0, 0] = cos_a * scales
+            theta[:, 0, 1] = -sin_a * scales
+            theta[:, 0, 2] = tx
+            theta[:, 1, 0] = sin_a * scales
+            theta[:, 1, 1] = cos_a * scales
+            theta[:, 1, 2] = ty
+
+            # Apply affine transform
+            grid = F.affine_grid(theta, x_affine.shape, align_corners=False)
+            x_affine = F.grid_sample(x_affine, grid, mode='bilinear',
+                                      padding_mode='reflection', align_corners=False)
+            x[affine_mask] = x_affine
+
+        # ============================================================
+        # 2. COLOR AUGMENTATIONS
+        # ============================================================
+
+        # 2a. Color Jitter (per-sample random)
         # Brightness
-        brightness = 1.0 + (torch.rand(B, 1, 1, 1, device=device) - 0.5) * 0.8
+        brightness = 1.0 + (torch.rand(B, 1, 1, 1, device=device) - 0.5) * 0.8  # [0.6, 1.4]
         x = x * brightness
 
         # Contrast
         gray = x.mean(dim=1, keepdim=True)
-        contrast = 1.0 + (torch.rand(B, 1, 1, 1, device=device) - 0.5) * 0.8
+        contrast = 1.0 + (torch.rand(B, 1, 1, 1, device=device) - 0.5) * 0.8  # [0.6, 1.4]
         x = gray + (x - gray) * contrast
 
         # Saturation
         gray = x.mean(dim=1, keepdim=True)
-        saturation = 1.0 + (torch.rand(B, 1, 1, 1, device=device) - 0.5) * 0.8
+        saturation = 1.0 + (torch.rand(B, 1, 1, 1, device=device) - 0.5) * 0.8  # [0.6, 1.4]
         x = gray + (x - gray) * saturation
 
-        # Hue shift
+        # Hue shift (simplified - just rotate channels slightly)
         hue_mask = torch.rand(B, device=device) < 0.5
         if hue_mask.any():
             x[hue_mask] = x[hue_mask][:, [2, 1, 0], :, :]
 
-        # Random Grayscale (20%)
+        # 2b. Random Grayscale (20% chance)
         gray_mask = torch.rand(B, device=device) < 0.2
         if gray_mask.any():
             gray_val = x[gray_mask].mean(dim=1, keepdim=True)
             x[gray_mask] = gray_val.expand(-1, 3, -1, -1)
 
-        # Gaussian Blur (50%)
+        # 2c. Gaussian Blur (50% chance) - simple 3x3 averaging
         blur_mask = torch.rand(B, device=device) < 0.5
         if blur_mask.any():
             kernel = torch.ones(3, 1, 3, 3, device=device) / 9.0
@@ -456,7 +486,7 @@ class StrongAugment(nn.Module):
             )
             x[blur_mask] = blurred
 
-        # Random Solarize (10%)
+        # 2d. Random Solarize (10% chance)
         solar_mask = torch.rand(B, device=device) < 0.1
         if solar_mask.any():
             threshold = 0.5
@@ -464,43 +494,10 @@ class StrongAugment(nn.Module):
             high_mask = x[solar_mask] > threshold
             x[solar_mask] = torch.where(high_mask, inverted, x[solar_mask])
 
-        return x
-
-    def forward(self, x: torch.Tensor, spatial_only: bool = False,
-                color_only: bool = False, return_params: bool = False):
-        """Apply augmentations to normalized images.
-
-        Args:
-            x: [B, 3, 32, 32] normalized images
-            spatial_only: apply only spatial augmentations
-            color_only: apply only color augmentations
-            return_params: return spatial augmentation params for correspondence
-        Returns:
-            if return_params: (augmented, params)
-            else: augmented
-        """
-        device = x.device
-        mean = self.mean.to(device)
-        std = self.std.to(device)
-
-        # Denormalize first
-        x = x * std + mean  # [0, 1] range
-
-        params = None
-        if not color_only:
-            if return_params:
-                x, params = self.spatial_augment_with_params(x)
-            else:
-                x = self.spatial_augment(x)
-        if not spatial_only:
-            x = self.color_augment(x)
-
         # Clamp and renormalize
         x = x.clamp(0, 1)
         x = (x - mean) / std
 
-        if return_params:
-            return x, params
         return x
 
 
@@ -508,17 +505,17 @@ class VAREncoderCIFAR(nn.Module):
     """VAR-Encoder for CIFAR-100 with Cross-View Prediction.
 
     Architecture:
-    Input: [CLS, S1_real, S2_real, S3_real] (ALL real embeddings!)
-    Two augmented views from same image
-    Cross-View Prediction:
-    - view1의 S1 → view2의 S2 예측 (coarse → fine)
-    - view1의 S2 → view2의 S3 예측 (coarse → fine)
-    - 반대 방향도 동일하게
+        Input: [CLS, S1_real, S2_real, S3_real] (ALL real embeddings!)
+        Two augmented views from same image
+        Cross-View Prediction:
+            - view1의 S1 → view2의 S2 예측 (coarse → fine)
+            - view1의 S2 → view2의 S3 예측 (coarse → fine)
+            - 반대 방향도 동일하게
 
     Key insight:
-    - 다른 augmentation → low-level shortcut 방지
-    - Color, blur, crop이 달라 → semantic만 남음
-    - DINO/BYOL과 유사한 검증된 방법
+        - 다른 augmentation → low-level shortcut 방지
+        - Color, blur, crop이 달라 → semantic만 남음
+        - DINO/BYOL과 유사한 검증된 방법
     """
 
     def __init__(self, config: CIFARConfig):
@@ -607,10 +604,10 @@ class VAREncoderCIFAR(nn.Module):
 
         # Extract hidden states for each scale
         return {
-            'cls': hidden[:, 0],      # [B, dim]
-            's1': hidden[:, 1:5],     # [B, 4, dim]
-            's2': hidden[:, 5:21],    # [B, 16, dim]
-            's3': hidden[:, 21:85],   # [B, 64, dim]
+            'cls': hidden[:, 0],           # [B, dim]
+            's1': hidden[:, 1:5],          # [B, 4, dim]
+            's2': hidden[:, 5:21],         # [B, 16, dim]
+            's3': hidden[:, 21:85],        # [B, 64, dim]
         }
 
     def spatial_pool(self, x: torch.Tensor, from_grid: int, to_grid: int) -> torch.Tensor:
@@ -647,57 +644,48 @@ class VAREncoderCIFAR(nn.Module):
         """
         B = images.shape[0]
 
-        # Two augmented views with correspondence tracking
-        view1, params1 = self.augment(images.clone(), return_params=True)
-        view2, params2 = self.augment(images.clone(), return_params=True)
+        # Two augmented views from same image
+        view1 = self.augment(images)
+        view2 = self.augment(images)
 
         # Encode both views (shared weights)
-        h1 = self.encode_all_scales(view1)
-        h2 = self.encode_all_scales(view2)
+        h1 = self.encode_all_scales(view1)  # dict: {cls, s1, s2, s3}
+        h2 = self.encode_all_scales(view2)  # dict: {cls, s1, s2, s3}
 
         # ============================================================
         # 1. CLS-CLS SimCLR Loss (global representation alignment)
         # ============================================================
-        if self.config.use_cls_loss:
-            loss_cls = self.infonce_cls(h1['cls'], h2['cls'])
-        else:
-            loss_cls = torch.tensor(0.0, device=h1['cls'].device)
+        loss_cls = self.infonce_cls(h1['cls'], h2['cls'])
 
         # ============================================================
-        # 2. Cross-view Hierarchical Loss with Correspondence Tracking
+        # 2. Cross-view Hierarchical Loss with Spatial Matching
         # ============================================================
-        # Compute correspondences for each scale (after pooling)
-        # S1: 2x2 grid, S2: 4x4 grid
-        corr_s1 = self.compute_correspondence(params1, params2, grid_size=2)  # [B, 4]
-        corr_s2 = self.compute_correspondence(params1, params2, grid_size=4)  # [B, 16]
-        corr_s1_rev = self.compute_correspondence(params2, params1, grid_size=2)
-        corr_s2_rev = self.compute_correspondence(params2, params1, grid_size=4)
+        # S1 (2x2=4) predicts S2 (4x4=16) pooled to (2x2=4)
+        # S2 (4x4=16) predicts S3 (8x8=64) pooled to (4x4=16)
 
-        # v1 coarse → v2 fine (pooled) with correspondence
+        # v1 coarse → v2 fine (pooled)
         h2_s2_pooled = self.spatial_pool(h2['s2'], from_grid=4, to_grid=2)  # [B, 4, dim]
         h2_s3_pooled = self.spatial_pool(h2['s3'], from_grid=8, to_grid=4)  # [B, 16, dim]
-        loss_12_s1s2 = self.infonce_spatial_with_correspondence(h1['s1'], h2_s2_pooled, corr_s1)
-        loss_12_s2s3 = self.infonce_spatial_with_correspondence(h1['s2'], h2_s3_pooled, corr_s2)
+        loss_12_s1s2 = self.infonce_spatial(h1['s1'], h2_s2_pooled)  # [B, 4, dim] vs [B, 4, dim]
+        loss_12_s2s3 = self.infonce_spatial(h1['s2'], h2_s3_pooled)  # [B, 16, dim] vs [B, 16, dim]
 
-        # v2 coarse → v1 fine (pooled) with correspondence
+        # v2 coarse → v1 fine (pooled)
         h1_s2_pooled = self.spatial_pool(h1['s2'], from_grid=4, to_grid=2)  # [B, 4, dim]
         h1_s3_pooled = self.spatial_pool(h1['s3'], from_grid=8, to_grid=4)  # [B, 16, dim]
-        loss_21_s1s2 = self.infonce_spatial_with_correspondence(h2['s1'], h1_s2_pooled, corr_s1_rev)
-        loss_21_s2s3 = self.infonce_spatial_with_correspondence(h2['s2'], h1_s3_pooled, corr_s2_rev)
+        loss_21_s1s2 = self.infonce_spatial(h2['s1'], h1_s2_pooled)
+        loss_21_s2s3 = self.infonce_spatial(h2['s2'], h1_s3_pooled)
 
         loss_hier = (loss_12_s1s2 + loss_12_s2s3 + loss_21_s1s2 + loss_21_s2s3) / 4
 
         # ============================================================
         # 3. Combined Loss
         # ============================================================
-        if self.config.use_cls_loss:
-            loss = 0.5 * loss_cls + 0.5 * loss_hier
-        else:
-            loss = loss_hier
+        # CLS loss weight: 0.5, Hierarchical loss weight: 0.5
+        loss = 0.5 * loss_cls + 0.5 * loss_hier
 
         return {
             'loss': loss,
-            'loss_cls': loss_cls.item() if self.config.use_cls_loss else 0.0,
+            'loss_cls': loss_cls.item(),
             'loss_hier': loss_hier.item(),
             'cls': h1['cls'],
         }
@@ -757,79 +745,6 @@ class VAREncoderCIFAR(nn.Module):
         # InfoNCE: each position matches its corresponding position
         # logits[i, j] = similarity between pred[i] and target[j]
         logits = pred_norm @ target_norm.T / tau  # [B*N, B*N]
-        labels = torch.arange(B * N, device=logits.device)
-
-        return F.cross_entropy(logits, labels)
-
-    def compute_correspondence(self, params1: dict, params2: dict, grid_size: int) -> torch.Tensor:
-        """Compute token correspondence between two views (flip only).
-
-        For horizontal flip:
-        - Token at column j maps to column (grid_size - 1 - j) when flipped
-        - XOR logic: flip1 XOR flip2 determines if positions differ
-
-        Args:
-            params1: {'flip_mask': [B]} from view1
-            params2: {'flip_mask': [B]} from view2
-            grid_size: grid size (e.g., 2 for S1, 4 for S2)
-        Returns:
-            correspondence: [B, grid_size^2] indices into view2 tokens
-        """
-        B = params1['flip_mask'].shape[0]
-        device = params1['flip_mask'].device
-        N = grid_size * grid_size
-
-        # Base indices (identity mapping)
-        # Token index = row * grid_size + col
-        base_idx = torch.arange(N, device=device).unsqueeze(0).expand(B, -1)  # [B, N]
-
-        # Flipped indices: for each token, compute horizontally flipped position
-        # row stays same, col -> (grid_size - 1 - col)
-        rows = base_idx // grid_size  # [B, N]
-        cols = base_idx % grid_size   # [B, N]
-        flipped_cols = grid_size - 1 - cols
-        flipped_idx = rows * grid_size + flipped_cols  # [B, N]
-
-        # XOR: need to flip correspondence if exactly one view is flipped
-        need_flip = params1['flip_mask'] ^ params2['flip_mask']  # [B]
-
-        # Select based on need_flip
-        correspondence = torch.where(
-            need_flip.unsqueeze(1).expand(-1, N),
-            flipped_idx,
-            base_idx
-        )
-
-        return correspondence
-
-    def infonce_spatial_with_correspondence(self, pred: torch.Tensor, target: torch.Tensor,
-                                            correspondence: torch.Tensor) -> torch.Tensor:
-        """Spatial-aware InfoNCE with correspondence tracking.
-
-        Args:
-            pred: [B, N, dim] - source tokens
-            target: [B, N, dim] - target tokens
-            correspondence: [B, N] - indices mapping pred positions to target positions
-        Returns:
-            scalar loss
-        """
-        B, N, D = pred.shape
-        tau = self.config.temperature
-
-        # Reorder target according to correspondence
-        # target_reordered[b, i] = target[b, correspondence[b, i]]
-        batch_idx = torch.arange(B, device=pred.device).unsqueeze(1).expand(-1, N)
-        target_reordered = target[batch_idx, correspondence]  # [B, N, dim]
-
-        # Now use standard position-wise InfoNCE
-        pred_flat = pred.reshape(B * N, D)
-        target_flat = target_reordered.reshape(B * N, D)
-
-        pred_proj = self.predictor(pred_flat)
-        pred_norm = F.normalize(pred_proj, dim=-1)
-        target_norm = F.normalize(target_flat.detach(), dim=-1)
-
-        logits = pred_norm @ target_norm.T / tau
         labels = torch.arange(B * N, device=logits.device)
 
         return F.cross_entropy(logits, labels)
@@ -1039,12 +954,12 @@ def visualize_attention(model, test_loader, device, save_path='attention.png', n
     """DINO-style attention visualization with per-head breakdown.
 
     Layout:
-    Row 0: Original images
-    Row 1: Head 0 attention
-    Row 2: Head 1 attention
-    ...
-    Row H: Head H-1 attention
-    Row H+1: Mean attention (all heads)
+        Row 0: Original images
+        Row 1: Head 0 attention
+        Row 2: Head 1 attention
+        ...
+        Row H: Head H-1 attention
+        Row H+1: Mean attention (all heads)
     """
     model.eval()
 
@@ -1162,52 +1077,36 @@ def full_evaluation(model, train_loader, test_loader, device, output_dir='output
 # Main
 # ============================================================
 
-def set_seed(seed: int):
-    """Set random seed for reproducibility."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-
 def main():
     config = CIFARConfig()
-
-    # Set seed for reproducibility
-    set_seed(config.seed)
-
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     print("=" * 60)
     print("VAR-Encoder CIFAR-100 PoC (Cross-View Prediction)")
     print("=" * 60)
     print(f"Device: {device}")
-    print(f"Seed: {config.seed}")
     print(f"Scales: {CIFAR_SCALE_CONFIGS}")
     print(f"Total tokens: {CIFAR_TOTAL_TOKENS} (CLS + {CIFAR_TOTAL_PATCH_TOKENS} patches)")
 
     boundaries = get_scale_boundaries()
     print(f"\nArchitecture:")
-    print(f" Input: [CLS, S1_real, S2_real, S3_real] (ALL real embeddings!)")
-    print(f" Attention Mask (all scales independent):")
-    print(f" CLS [{boundaries[0]}:{boundaries[1]}] → sees CLS + S3 only")
-    print(f" S1 [{boundaries[1]}:{boundaries[2]}] → sees CLS + S1 only")
-    print(f" S2 [{boundaries[2]}:{boundaries[3]}] → sees CLS + S2 only")
-    print(f" S3 [{boundaries[3]}:{boundaries[4]}] → sees CLS + S3 only")
-    print(f" Fast Inference:")
-    print(f" CLS + S3 only (65 tokens instead of 85)")
-    print(f" S1, S2 are training-only for hierarchical loss")
-    print(f" Cross-View Prediction (with Correspondence Tracking):")
-    print(f"  view1, params1 = augment(image)  # 독립적 spatial + color")
-    print(f"  view2, params2 = augment(image)  # 독립적 spatial + color")
-    print(f"  corr = compute_correspondence(params1, params2)  # 공간 매핑")
-    print(f"  h1_S1 → h2_S2[corr] (InfoNCE)  # 올바른 위치끼리 매칭")
-    print(f"  h1_S2 → h2_S3[corr] (InfoNCE)")
-    print(f"  h2_S1 → h1_S2[corr] (InfoNCE)  # reverse direction")
-    print(f"  h2_S2 → h1_S3[corr] (InfoNCE)")
-    print(f" Temperature: {config.temperature}")
+    print(f"  Input: [CLS, S1_real, S2_real, S3_real] (ALL real embeddings!)")
+    print(f"  Attention Mask (all scales independent):")
+    print(f"    CLS [{boundaries[0]}:{boundaries[1]}] → sees CLS + S3 only")
+    print(f"    S1 [{boundaries[1]}:{boundaries[2]}] → sees CLS + S1 only")
+    print(f"    S2 [{boundaries[2]}:{boundaries[3]}] → sees CLS + S2 only")
+    print(f"    S3 [{boundaries[3]}:{boundaries[4]}] → sees CLS + S3 only")
+    print(f"  Fast Inference:")
+    print(f"    CLS + S3 only (65 tokens instead of 85)")
+    print(f"    S1, S2 are training-only for hierarchical loss")
+    print(f"  Cross-View Prediction:")
+    print(f"    view1 = augment(image)")
+    print(f"    view2 = augment(image)  # different random augmentation")
+    print(f"    h1_S1 → h2_S2 (InfoNCE)  # v1 coarse → v2 fine")
+    print(f"    h1_S2 → h2_S3 (InfoNCE)")
+    print(f"    h2_S1 → h1_S2 (InfoNCE)  # reverse direction")
+    print(f"    h2_S2 → h1_S3 (InfoNCE)")
+    print(f"  Temperature: {config.temperature}")
 
     # Model
     model = VAREncoderCIFAR(config).to(device)
@@ -1258,8 +1157,7 @@ def main():
             if last_knn > best_knn:
                 best_knn = last_knn
 
-        # Visualizations (every 10 epochs)
-        if epoch % 10 == 0 or epoch == 1:
+            # Visualizations
             epoch_dir = f'outputs/epoch{epoch}'
             os.makedirs(epoch_dir, exist_ok=True)
             visualize_tsne(model, test_loader, device,
@@ -1291,7 +1189,7 @@ def main():
         if test_loss < best_loss:
             best_loss = test_loss
             torch.save(model.state_dict(), 'best_model_cifar.pt')
-            print(f" → Best model saved! (loss={best_loss:.4f})")
+            print(f"  → Best model saved! (loss={best_loss:.4f})")
 
     # Final evaluation
     print("\n" + "=" * 60)
