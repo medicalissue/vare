@@ -60,7 +60,7 @@ import random
 class CIFARConfig:
     # Model
     dim: int = 256
-    depth: int = 6
+    depth: int = 14
     num_heads: int = 8
     mlp_ratio: float = 4.0
     patch_size: int = 4  # 4x4 patches for CIFAR
@@ -70,7 +70,7 @@ class CIFARConfig:
     temperature: float = 0.07  # InfoNCE temperature
 
     # Data
-    batch_size: int = 512
+    batch_size: int = 256
     num_workers: int = 4
 
     # Training
@@ -105,6 +105,9 @@ class CIFARConfig:
                                  [0,1,1,0],
                                  [1,0,0,1]]
     )
+
+    # Loss options
+    use_cls_loss: bool = True  # Enable/disable CLS-CLS SimCLR loss
 
 
 # ============================================================
@@ -809,7 +812,10 @@ class VAREncoderCIFAR(nn.Module):
         # ============================================================
         # 1. CLS-CLS SimCLR Loss (global representation - spatial invariance)
         # ============================================================
-        loss_cls = self.infonce_cls(h1['cls'], h2['cls'])
+        if self.config.use_cls_loss:
+            loss_cls = self.infonce_cls(h1['cls'], h2['cls'])
+        else:
+            loss_cls = torch.tensor(0.0, device=images.device)
 
         # ============================================================
         # 2. Cross-view Hierarchical Loss with Flip Correspondence
@@ -840,8 +846,12 @@ class VAREncoderCIFAR(nn.Module):
         # ============================================================
         # 3. Combined Loss
         # ============================================================
-        # CLS loss weight: 0.5, Hierarchical loss weight: 0.5
-        loss = 0.5 * loss_cls + 0.5 * loss_hier
+        if self.config.use_cls_loss:
+            # CLS loss weight: 0.5, Hierarchical loss weight: 0.5
+            loss = 0.5 * loss_cls + 0.5 * loss_hier
+        else:
+            # Only hierarchical loss
+            loss = loss_hier
 
         return {
             'loss': loss,
@@ -1112,7 +1122,7 @@ def extract_features(model, loader, device):
     return features.numpy(), labels.numpy()
 
 
-def knn_evaluate(model, train_loader, test_loader, device, k=20):
+def knn_evaluate(model, train_loader, test_loader, device, k=5):
     """k-NN classification accuracy (DINO-style)."""
     print(f"\n--- k-NN Evaluation (k={k}) ---")
 
