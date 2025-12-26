@@ -86,20 +86,6 @@ class CIFARConfig:
     # Reproducibility
     seed: int = 42
 
-    # Loss settings
-    use_cls_loss: bool = False  # False: disable CLS-CLS contrastive loss
-    use_correspondence: bool = True  # False: position-wise without tracking
-
-    # Attention mask matrix (4x4: cls, s1, s2, s3)
-    # Row = source, Col = target, 1 = attend, 0 = mask
-    # Format: "1 0 0 1; 1 1 0 0; 1 0 1 0; 1 0 0 1" (semicolon separates rows)
-    #         cls s1 s2 s3
-    #    cls [  1  0  0  1 ]  <- cls sees cls, s3
-    #    s1  [  1  1  0  0 ]  <- s1 sees cls, s1
-    #    s2  [  1  0  1  0 ]  <- s2 sees cls, s2
-    #    s3  [  1  0  0  1 ]  <- s3 sees cls, s3
-    attention_mask: str = "1 0 0 1; 1 0 0 0; 0 1 0 0; 0 0 0 1"
-
 
 # ============================================================
 # Scale configs for CIFAR (32x32)
@@ -125,66 +111,52 @@ def get_scale_boundaries() -> List[int]:
     return boundaries
 
 
-def parse_attention_matrix(matrix_str: str) -> List[List[int]]:
-    """Parse attention matrix string into 4x4 list.
+@lru_cache(maxsize=1)
+def build_causal_mask(device: str = 'cpu') -> torch.Tensor:
+    """Build causal mask with CLS/S3 only seeing CLS+S3.
 
-    Format: "1 0 0 1; 1 1 0 0; 1 0 1 0; 1 0 0 1"
-    Returns: [[1,0,0,1], [1,1,0,0], [1,0,1,0], [1,0,0,1]]
-    """
-    rows = matrix_str.strip().split(";")
-    matrix = []
-    for row in rows:
-        values = [int(v) for v in row.strip().split()]
-        matrix.append(values)
-    return matrix
+    Mask structure (85 x 85):
+    CLS │ S1(4) │ S2(16) │ S3(64)
+    ─────┼───────┼────────┼────────
+    CLS │ ✓ │ ✗ │ ✗ │ ✓ ← CLS sees CLS + S3 only
+    S1 │ ✓ │ ✓ │ ✗ │ ✗ ← S1 sees CLS + S1 only
+    S2 │ ✓ │ ✗ │ ✓ │ ✗ ← S2 sees CLS + S2 only
+    S3 │ ✓ │ ✗ │ ✗ │ ✓ ← S3 sees CLS + S3 only
 
-
-def build_mask_from_matrix(matrix_str: str, device: str = 'cpu') -> torch.Tensor:
-    """Build attention mask from 4x4 matrix string.
-
-    Args:
-        matrix_str: e.g., "1 0 0 1; 1 1 0 0; 1 0 1 0; 1 0 0 1"
-        device: target device
-    Returns:
-        [85, 85] attention mask
+    Key Insight:
+    - All scales are independent: each sees only CLS + itself
+    - CLS and S3 are self-contained → inference needs only CLS + S3 (65 tokens)
+    - S1, S2 are training-only for hierarchical loss
     """
     total = CIFAR_TOTAL_TOKENS
     mask = torch.full((total, total), float('-inf'))
 
-    # Token ranges: [start, end) for cls, s1, s2, s3
-    ranges = [(0, 1), (1, 5), (5, 21), (21, 85)]
+    cumsum = [0]
+    for n in CIFAR_TOKENS_PER_SCALE:
+        cumsum.append(cumsum[-1] + n)
+    # cumsum = [0, 1, 5, 21, 85]
 
-    matrix = parse_attention_matrix(matrix_str)
+    s1_start, s1_end = cumsum[1], cumsum[2]
+    s2_start, s2_end = cumsum[2], cumsum[3]
+    s3_start, s3_end = cumsum[3], cumsum[4]
 
-    for i, (src_start, src_end) in enumerate(ranges):
-        for j, (tgt_start, tgt_end) in enumerate(ranges):
-            if matrix[i][j] == 1:
-                mask[src_start:src_end, tgt_start:tgt_end] = 0
+    # CLS (i=0): sees CLS + S3 only
+    mask[0, 0] = 0  # CLS sees CLS
+    mask[0, s3_start:s3_end] = 0  # CLS sees S3
+
+    # S1: sees CLS + S1
+    mask[s1_start:s1_end, 0:1] = 0
+    mask[s1_start:s1_end, s1_start:s1_end] = 0
+
+    # S2: sees CLS + S2 only (independent, no S1 dependency)
+    mask[s2_start:s2_end, 0:1] = 0
+    mask[s2_start:s2_end, s2_start:s2_end] = 0
+
+    # S3: sees CLS + S3 only
+    mask[s3_start:s3_end, 0:1] = 0  # S3 sees CLS
+    mask[s3_start:s3_end, s3_start:s3_end] = 0  # S3 sees S3
 
     return mask.to(device)
-
-
-# Cache for attention masks (matrix_str -> mask)
-_mask_cache: dict = {}
-
-
-def get_cached_mask(matrix_str: str, device: str) -> torch.Tensor:
-    """Get cached attention mask for matrix."""
-    key = (matrix_str, device)
-    if key not in _mask_cache:
-        _mask_cache[key] = build_mask_from_matrix(matrix_str, device)
-    return _mask_cache[key]
-
-
-@lru_cache(maxsize=1)
-def build_causal_mask(device: str = 'cpu') -> torch.Tensor:
-    """Build default causal mask (independent scales).
-
-    Kept for backward compatibility.
-    """
-    return build_mask_from_matrix(
-        "1 0 0 1; 1 1 0 0; 1 0 1 0; 1 0 0 1", device
-    )
 
 
 @lru_cache(maxsize=1)
@@ -325,8 +297,7 @@ class MLP(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, dim: int, num_heads: int, attn_drop: float = 0.0, proj_drop: float = 0.0,
-                 attention_mask: str = None):
+    def __init__(self, dim: int, num_heads: int, attn_drop: float = 0.0, proj_drop: float = 0.0):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
@@ -338,7 +309,6 @@ class Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
 
         self.rope = RoPE2D(self.head_dim)
-        self.attention_mask = attention_mask  # Store mask config
         self._mask = None
         self._fast_mask = None
 
@@ -367,12 +337,9 @@ class Attention(nn.Module):
                 self._fast_mask = build_fast_mask(str(x.device))
             attn = attn + self._fast_mask.unsqueeze(0).unsqueeze(0)
         else:
-            # Full training mode: use configured mask
+            # Full training mode: all 85 tokens
             if self._mask is None or self._mask.device != x.device:
-                if self.attention_mask is not None:
-                    self._mask = get_cached_mask(self.attention_mask, str(x.device))
-                else:
-                    self._mask = build_causal_mask(str(x.device))
+                self._mask = build_causal_mask(str(x.device))
             attn = attn + self._mask.unsqueeze(0).unsqueeze(0)
 
         attn = attn.softmax(dim=-1)
@@ -387,10 +354,10 @@ class Attention(nn.Module):
 
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, mlp_ratio: float = 4.0,
-                 drop: float = 0.0, attn_drop: float = 0.0, attention_mask: str = None):
+                 drop: float = 0.0, attn_drop: float = 0.0):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
-        self.attn = Attention(dim, num_heads, attn_drop, drop, attention_mask=attention_mask)
+        self.attn = Attention(dim, num_heads, attn_drop, drop)
         self.norm2 = nn.LayerNorm(dim)
         self.mlp = MLP(dim, int(dim * mlp_ratio), drop)
 
@@ -580,7 +547,7 @@ class VAREncoderCIFAR(nn.Module):
         # Transformer blocks
         self.blocks = nn.ModuleList([
             Block(config.dim, config.num_heads, config.mlp_ratio,
-                  config.drop, config.attn_drop, attention_mask=config.attention_mask)
+                  config.drop, config.attn_drop)
             for _ in range(config.depth)
         ])
         self.norm = nn.LayerNorm(config.dim)
@@ -697,30 +664,26 @@ class VAREncoderCIFAR(nn.Module):
             loss_cls = torch.tensor(0.0, device=h1['cls'].device)
 
         # ============================================================
-        # 2. Cross-view Hierarchical Loss
+        # 2. Cross-view Hierarchical Loss with Correspondence Tracking
         # ============================================================
+        # Compute correspondences for each scale (after pooling)
+        # S1: 2x2 grid, S2: 4x4 grid
+        corr_s1 = self.compute_correspondence(params1, params2, grid_size=2)  # [B, 4]
+        corr_s2 = self.compute_correspondence(params1, params2, grid_size=4)  # [B, 16]
+        corr_s1_rev = self.compute_correspondence(params2, params1, grid_size=2)
+        corr_s2_rev = self.compute_correspondence(params2, params1, grid_size=4)
+
+        # v1 coarse → v2 fine (pooled) with correspondence
         h2_s2_pooled = self.spatial_pool(h2['s2'], from_grid=4, to_grid=2)  # [B, 4, dim]
         h2_s3_pooled = self.spatial_pool(h2['s3'], from_grid=8, to_grid=4)  # [B, 16, dim]
+        loss_12_s1s2 = self.infonce_spatial_with_correspondence(h1['s1'], h2_s2_pooled, corr_s1)
+        loss_12_s2s3 = self.infonce_spatial_with_correspondence(h1['s2'], h2_s3_pooled, corr_s2)
+
+        # v2 coarse → v1 fine (pooled) with correspondence
         h1_s2_pooled = self.spatial_pool(h1['s2'], from_grid=4, to_grid=2)  # [B, 4, dim]
         h1_s3_pooled = self.spatial_pool(h1['s3'], from_grid=8, to_grid=4)  # [B, 16, dim]
-
-        if self.config.use_correspondence:
-            # With correspondence tracking (flip-aware)
-            corr_s1 = self.compute_correspondence(params1, params2, grid_size=2)  # [B, 4]
-            corr_s2 = self.compute_correspondence(params1, params2, grid_size=4)  # [B, 16]
-            corr_s1_rev = self.compute_correspondence(params2, params1, grid_size=2)
-            corr_s2_rev = self.compute_correspondence(params2, params1, grid_size=4)
-
-            loss_12_s1s2 = self.infonce_spatial_with_correspondence(h1['s1'], h2_s2_pooled, corr_s1)
-            loss_12_s2s3 = self.infonce_spatial_with_correspondence(h1['s2'], h2_s3_pooled, corr_s2)
-            loss_21_s1s2 = self.infonce_spatial_with_correspondence(h2['s1'], h1_s2_pooled, corr_s1_rev)
-            loss_21_s2s3 = self.infonce_spatial_with_correspondence(h2['s2'], h1_s3_pooled, corr_s2_rev)
-        else:
-            # Without correspondence tracking (position-wise only)
-            loss_12_s1s2 = self.infonce_spatial(h1['s1'], h2_s2_pooled)
-            loss_12_s2s3 = self.infonce_spatial(h1['s2'], h2_s3_pooled)
-            loss_21_s1s2 = self.infonce_spatial(h2['s1'], h1_s2_pooled)
-            loss_21_s2s3 = self.infonce_spatial(h2['s2'], h1_s3_pooled)
+        loss_21_s1s2 = self.infonce_spatial_with_correspondence(h2['s1'], h1_s2_pooled, corr_s1_rev)
+        loss_21_s2s3 = self.infonce_spatial_with_correspondence(h2['s2'], h1_s3_pooled, corr_s2_rev)
 
         loss_hier = (loss_12_s1s2 + loss_12_s2s3 + loss_21_s1s2 + loss_21_s2s3) / 4
 
@@ -911,14 +874,8 @@ class VAREncoderCIFAR(nn.Module):
 # ============================================================
 
 def get_cifar100_loaders(config: CIFARConfig):
-    # Basic spatial augmentation at data loading (shared across both views)
+    # No augmentation here - StrongAugment handles everything per-view
     transform_train = transforms.Compose([
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomAffine(
-            degrees=15,           # rotation ±15°
-            translate=(0.1, 0.1), # shift up to 10%
-            scale=(0.9, 1.1),     # scale 90%-110%
-        ),
         transforms.ToTensor(),
         transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
     ])
@@ -1251,13 +1208,6 @@ def main():
     print(f"  h2_S1 → h1_S2[corr] (InfoNCE)  # reverse direction")
     print(f"  h2_S2 → h1_S3[corr] (InfoNCE)")
     print(f" Temperature: {config.temperature}")
-    print(f" Use Correspondence: {config.use_correspondence}")
-    print(f" Attention Mask:")
-    matrix = parse_attention_matrix(config.attention_mask)
-    print(f"         cls s1 s2 s3")
-    labels = ["cls", "s1 ", "s2 ", "s3 "]
-    for i, row in enumerate(matrix):
-        print(f"    {labels[i]} [ {' '.join(str(v) for v in row)} ]")
 
     # Model
     model = VAREncoderCIFAR(config).to(device)
