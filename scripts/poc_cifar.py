@@ -45,10 +45,11 @@ import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
 from sklearn.neighbors import KNeighborsClassifier
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, List, Tuple
 from functools import lru_cache
 import os
+import random
 
 
 # ============================================================
@@ -82,6 +83,26 @@ class CIFARConfig:
     use_wandb: bool = True
     project: str = "vare-poc"
 
+    # Random seed (None = no seed fixing)
+    seed: Optional[int] = 41
+
+    # Mixed precision training (AMP)
+    use_amp: bool = True
+
+    # torch.compile for PyTorch 2.0+ (can give 10-30% speedup)
+    use_compile: bool = False
+
+    # Custom attention mask (4x4 matrix for [CLS, S1, S2, S3] x [CLS, S1, S2, S3])
+    # Example: [[1,0,0,1], [1,1,0,0], [1,0,1,0], [1,0,0,1]] means:
+    #   - CLS sees CLS + S3
+    #   - S1 sees CLS + S1
+    #   - S2 sees CLS + S2
+    #   - S3 sees CLS + S3
+    # 1 = attend, 0 = mask out. None = use default mask.
+    custom_attn_mask: Optional[List[List[int]]] = field(
+        default_factory=lambda: [[1,0,0,1], [1,1,0,0], [1,0,1,0], [1,0,0,1]]
+    )
+
 
 # ============================================================
 # Scale configs for CIFAR (32x32)
@@ -107,8 +128,50 @@ def get_scale_boundaries() -> List[int]:
     return boundaries
 
 
-@lru_cache(maxsize=1)
-def build_causal_mask(device: str = 'cpu') -> torch.Tensor:
+def build_causal_mask_from_matrix(
+    attn_matrix: List[List[int]],
+    device: str = 'cpu'
+) -> torch.Tensor:
+    """Build 85x85 attention mask from 4x4 block attention matrix.
+
+    Args:
+        attn_matrix: 4x4 matrix where attn_matrix[i][j] = 1 means block i can attend to block j.
+                     Block order: [CLS, S1, S2, S3]
+                     Example: [[1,0,0,1], [1,1,0,0], [1,0,1,0], [1,0,0,1]]
+        device: target device
+
+    Returns:
+        85x85 attention mask (0 = attend, -inf = mask)
+    """
+    total = CIFAR_TOTAL_TOKENS
+    mask = torch.full((total, total), float('-inf'))
+
+    cumsum = [0]
+    for n in CIFAR_TOKENS_PER_SCALE:
+        cumsum.append(cumsum[-1] + n)
+    # cumsum = [0, 1, 5, 21, 85]
+
+    # Block ranges: CLS=[0,1), S1=[1,5), S2=[5,21), S3=[21,85)
+    block_ranges = [
+        (cumsum[0], cumsum[1]),  # CLS: [0, 1)
+        (cumsum[1], cumsum[2]),  # S1: [1, 5)
+        (cumsum[2], cumsum[3]),  # S2: [5, 21)
+        (cumsum[3], cumsum[4]),  # S3: [21, 85)
+    ]
+
+    for i, (row_start, row_end) in enumerate(block_ranges):
+        for j, (col_start, col_end) in enumerate(block_ranges):
+            if attn_matrix[i][j] == 1:
+                mask[row_start:row_end, col_start:col_end] = 0
+
+    return mask.to(device)
+
+
+# Cache for default mask
+_default_mask_cache: dict = {}
+
+
+def build_causal_mask(device: str = 'cpu', custom_mask: Optional[List[List[int]]] = None) -> torch.Tensor:
     """Build causal mask with CLS/S3 only seeing CLS+S3.
 
     Mask structure (85 x 85):
@@ -119,40 +182,34 @@ def build_causal_mask(device: str = 'cpu') -> torch.Tensor:
        S2  │  ✓  │   ✗   │   ✓    │   ✗     ← S2 sees CLS + S2 only
        S3  │  ✓  │   ✗   │   ✗    │   ✓     ← S3 sees CLS + S3 only
 
+    Args:
+        device: target device
+        custom_mask: Optional 4x4 matrix to override default mask.
+                     1 = attend, 0 = mask. Block order: [CLS, S1, S2, S3]
+
     Key Insight:
         - All scales are independent: each sees only CLS + itself
         - CLS and S3 are self-contained → inference needs only CLS + S3 (65 tokens)
         - S1, S2 are training-only for hierarchical loss
     """
-    total = CIFAR_TOTAL_TOKENS
-    mask = torch.full((total, total), float('-inf'))
+    # Use custom mask if provided
+    if custom_mask is not None:
+        return build_causal_mask_from_matrix(custom_mask, device)
 
-    cumsum = [0]
-    for n in CIFAR_TOKENS_PER_SCALE:
-        cumsum.append(cumsum[-1] + n)
-    # cumsum = [0, 1, 5, 21, 85]
+    # Use cached default mask
+    if device in _default_mask_cache:
+        return _default_mask_cache[device]
 
-    s1_start, s1_end = cumsum[1], cumsum[2]
-    s2_start, s2_end = cumsum[2], cumsum[3]
-    s3_start, s3_end = cumsum[3], cumsum[4]
-
-    # CLS (i=0): sees CLS + S3 only
-    mask[0, 0] = 0  # CLS sees CLS
-    mask[0, s3_start:s3_end] = 0  # CLS sees S3
-
-    # S1: sees CLS + S1
-    mask[s1_start:s1_end, 0:1] = 0
-    mask[s1_start:s1_end, s1_start:s1_end] = 0
-
-    # S2: sees CLS + S2 only (independent, no S1 dependency)
-    mask[s2_start:s2_end, 0:1] = 0
-    mask[s2_start:s2_end, s2_start:s2_end] = 0
-
-    # S3: sees CLS + S3 only
-    mask[s3_start:s3_end, 0:1] = 0  # S3 sees CLS
-    mask[s3_start:s3_end, s3_start:s3_end] = 0  # S3 sees S3
-
-    return mask.to(device)
+    # Default mask: each block sees only CLS + itself, except CLS sees CLS + S3
+    default_matrix = [
+        [1, 0, 0, 1],  # CLS sees CLS + S3
+        [1, 1, 0, 0],  # S1 sees CLS + S1
+        [1, 0, 1, 0],  # S2 sees CLS + S2
+        [1, 0, 0, 1],  # S3 sees CLS + S3
+    ]
+    mask = build_causal_mask_from_matrix(default_matrix, device)
+    _default_mask_cache[device] = mask
+    return mask
 
 
 @lru_cache(maxsize=1)
@@ -293,7 +350,8 @@ class MLP(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, dim: int, num_heads: int, attn_drop: float = 0.0, proj_drop: float = 0.0):
+    def __init__(self, dim: int, num_heads: int, attn_drop: float = 0.0, proj_drop: float = 0.0,
+                 custom_attn_mask: Optional[List[List[int]]] = None):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
@@ -307,6 +365,7 @@ class Attention(nn.Module):
         self.rope = RoPE2D(self.head_dim)
         self._mask = None
         self._fast_mask = None
+        self.custom_attn_mask = custom_attn_mask
 
     def forward(self, x: torch.Tensor, coords: torch.Tensor, fast_mode: bool = False) -> torch.Tensor:
         B, N, D = x.shape
@@ -335,7 +394,7 @@ class Attention(nn.Module):
         else:
             # Full training mode: all 85 tokens
             if self._mask is None or self._mask.device != x.device:
-                self._mask = build_causal_mask(str(x.device))
+                self._mask = build_causal_mask(str(x.device), custom_mask=self.custom_attn_mask)
             attn = attn + self._mask.unsqueeze(0).unsqueeze(0)
 
         attn = attn.softmax(dim=-1)
@@ -350,10 +409,11 @@ class Attention(nn.Module):
 
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, mlp_ratio: float = 4.0,
-                 drop: float = 0.0, attn_drop: float = 0.0):
+                 drop: float = 0.0, attn_drop: float = 0.0,
+                 custom_attn_mask: Optional[List[List[int]]] = None):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
-        self.attn = Attention(dim, num_heads, attn_drop, drop)
+        self.attn = Attention(dim, num_heads, attn_drop, drop, custom_attn_mask=custom_attn_mask)
         self.norm2 = nn.LayerNorm(dim)
         self.mlp = MLP(dim, int(dim * mlp_ratio), drop)
 
@@ -379,6 +439,7 @@ class StrongAugment(nn.Module):
         self.mean = torch.tensor([0.5071, 0.4867, 0.4408]).view(1, 3, 1, 1)
         self.std = torch.tensor([0.2675, 0.2565, 0.2761]).view(1, 3, 1, 1)
 
+    @torch.amp.autocast('cuda', enabled=False)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply random augmentation to normalized images.
 
@@ -387,6 +448,8 @@ class StrongAugment(nn.Module):
         Returns:
             [B, 3, 32, 32] augmented normalized images
         """
+        # Ensure float32 for augmentation operations
+        x = x.float()
         B, C, H, W = x.shape
         device = x.device
 
@@ -544,7 +607,8 @@ class VAREncoderCIFAR(nn.Module):
         # Transformer blocks
         self.blocks = nn.ModuleList([
             Block(config.dim, config.num_heads, config.mlp_ratio,
-                  config.drop, config.attn_drop)
+                  config.drop, config.attn_drop,
+                  custom_attn_mask=config.custom_attn_mask)
             for _ in range(config.depth)
         ])
         self.norm = nn.LayerNorm(config.dim)
@@ -809,31 +873,52 @@ def get_cifar100_loaders(config: CIFARConfig):
 
     train_loader = DataLoader(
         train_dataset, batch_size=config.batch_size, shuffle=True,
-        num_workers=config.num_workers, pin_memory=True
+        num_workers=config.num_workers, pin_memory=True,
+        persistent_workers=True if config.num_workers > 0 else False,
+        prefetch_factor=2 if config.num_workers > 0 else None,
     )
     test_loader = DataLoader(
         test_dataset, batch_size=config.batch_size, shuffle=False,
-        num_workers=config.num_workers, pin_memory=True
+        num_workers=config.num_workers, pin_memory=True,
+        persistent_workers=True if config.num_workers > 0 else False,
+        prefetch_factor=2 if config.num_workers > 0 else None,
     )
 
     return train_loader, test_loader
 
 
-def train_epoch(model, loader, optimizer, device, epoch):
+def train_epoch(model, loader, optimizer, device, epoch, base_seed: Optional[int] = None,
+                scaler: Optional[torch.amp.GradScaler] = None, use_amp: bool = False):
     model.train()
     total_loss = 0
     total_loss_cls = 0
     total_loss_hier = 0
 
+    # Set epoch-specific seed for reproducibility with diversity
+    if base_seed is not None:
+        epoch_seed = base_seed + epoch
+        torch.manual_seed(epoch_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(epoch_seed)
+
     pbar = tqdm(loader, desc=f"Epoch {epoch}")
     for images, _ in pbar:
-        images = images.to(device)
+        images = images.to(device, non_blocking=True)
 
-        optimizer.zero_grad()
-        output = model(images)
-        loss = output['loss']
-        loss.backward()
-        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)  # Faster than zero_grad()
+
+        # Mixed precision training
+        with torch.amp.autocast('cuda', enabled=use_amp):
+            output = model(images)
+            loss = output['loss']
+
+        if use_amp and scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
 
         total_loss += loss.item()
         total_loss_cls += output['loss_cls']
@@ -1074,11 +1159,42 @@ def full_evaluation(model, train_loader, test_loader, device, output_dir='output
 
 
 # ============================================================
+# Seed fixing
+# ============================================================
+
+def set_seed(seed: int, deterministic: bool = False):
+    """Fix random seed for reproducibility.
+
+    Args:
+        seed: Random seed
+        deterministic: If True, use deterministic algorithms (slower but reproducible).
+                      If False, allow non-deterministic for speed.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    else:
+        # Allow cudnn to find optimal algorithms (faster)
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
+    print(f"Random seed fixed: {seed} (deterministic={deterministic})")
+
+
+# ============================================================
 # Main
 # ============================================================
 
 def main():
     config = CIFARConfig()
+
+    # Fix random seed if specified
+    if config.seed is not None:
+        set_seed(config.seed)
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     print("=" * 60)
@@ -1107,11 +1223,24 @@ def main():
     print(f"    h2_S1 → h1_S2 (InfoNCE)  # reverse direction")
     print(f"    h2_S2 → h1_S3 (InfoNCE)")
     print(f"  Temperature: {config.temperature}")
+    if config.custom_attn_mask is not None:
+        print(f"\n  Custom Attention Mask (4x4):")
+        for i, row in enumerate(config.custom_attn_mask):
+            block_name = ['CLS', 'S1 ', 'S2 ', 'S3 '][i]
+            print(f"    {block_name}: {row}")
+    if config.seed is not None:
+        print(f"\n  Random Seed: {config.seed}")
 
     # Model
     model = VAREncoderCIFAR(config).to(device)
     num_params = sum(p.numel() for p in model.parameters())
     print(f"\nParameters: {num_params / 1e6:.2f}M")
+
+    # torch.compile (PyTorch 2.0+)
+    if config.use_compile and hasattr(torch, 'compile'):
+        print("Compiling model with torch.compile...")
+        model = torch.compile(model, mode='reduce-overhead')
+        print("Model compiled!")
 
     # Data
     train_loader, test_loader = get_cifar100_loaders(config)
@@ -1130,6 +1259,9 @@ def main():
         optimizer, T_max=config.epochs, eta_min=1e-6
     )
 
+    # Mixed precision scaler
+    scaler = torch.amp.GradScaler('cuda', enabled=config.use_amp) if config.use_amp else None
+
     # Wandb
     if config.use_wandb:
         wandb.init(project=config.project, config=vars(config))
@@ -1137,7 +1269,7 @@ def main():
 
     # Training loop
     print("\n" + "=" * 60)
-    print("Starting training...")
+    print(f"Starting training... (AMP={'ON' if config.use_amp else 'OFF'})")
     print("=" * 60)
 
     best_loss = float('inf')
@@ -1145,7 +1277,10 @@ def main():
     last_knn = 0.0
 
     for epoch in range(1, config.epochs + 1):
-        train_stats = train_epoch(model, train_loader, optimizer, device, epoch)
+        train_stats = train_epoch(
+            model, train_loader, optimizer, device, epoch,
+            base_seed=config.seed, scaler=scaler, use_amp=config.use_amp
+        )
         test_loss = evaluate(model, test_loader, device)
         scheduler.step()
 
