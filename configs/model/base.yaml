@@ -1,0 +1,14 @@
+# VAR-Encoder Base (ViT-B/16 scale)
+# ~86M parameters
+
+dim: 768
+depth: 12
+num_heads: 12
+mlp_ratio: 4.0
+patch_size: 16
+drop: 0.0
+attn_drop: 0.0
+drop_path: 0.1
+loss_type: cosine      # mse | cosine
+pos_type: rope       # mlp | rope | none
+use_flash_attn: true

@@ -1,0 +1,20 @@
+# VAR-Encoder main configuration
+# Override with: python train.py model=large train.epochs=100
+
+defaults:
+  - model: base
+  - data: imagenet
+  - train: default
+  - _self_
+
+# W&B logging
+wandb:
+  project: vare
+  entity: null  # Set your W&B entity
+  mode: online  # online | offline | disabled
+
+# Reproducibility
+seed: 42
+
+# Device
+device: cuda

@@ -1,0 +1,13 @@
+# VAR-Encoder Large (ViT-L/16 scale)
+# ~307M parameters
+
+dim: 1024
+depth: 24
+num_heads: 16
+mlp_ratio: 4.0
+patch_size: 16
+drop: 0.0
+attn_drop: 0.0
+drop_path: 0.2
+loss_type: mse
+use_flash_attn: true

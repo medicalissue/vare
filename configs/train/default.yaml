@@ -1,0 +1,19 @@
+# Default training configuration
+
+# Optimization
+epochs: 300
+lr: 1.5e-4
+weight_decay: 0.05
+warmup_epochs: 40
+min_lr: 1.0e-6
+grad_clip: 1.0
+
+# Mixed precision: fp32 | fp16 | bf16
+precision: bf16
+
+# Checkpointing
+save_every: 10
+output_dir: ./checkpoints
+
+# Logging
+log_every: 100

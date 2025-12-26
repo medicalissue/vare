@@ -1,0 +1,6 @@
+data/
+outputs/
+wandb/
+checkpoints/
+__pycache__/
+*.pt
