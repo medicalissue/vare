@@ -67,16 +67,16 @@ class CIFARConfig:
     drop: float = 0.0
     attn_drop: float = 0.0
     drop_path: float = 0.0
-    temperature: float = 0.4  # InfoNCE temperature
+    temperature: float = 0.2  # InfoNCE temperature
 
     # Data
-    batch_size: int = 256
+    batch_size: int = 512
     num_workers: int = 4
 
     # Training
     epochs: int = 500
     lr: float = 1e-3
-    weight_decay: float = 0.005
+    weight_decay: float = 0.05
     warmup_epochs: int = 10
 
     # Logging
@@ -103,24 +103,8 @@ class CIFARConfig:
         default_factory=lambda: [[1,0,0,1],
                                  [1,1,0,0],
                                  [0,1,1,0],
-                                 [0,0,0,1]]
+                                 [1,0,0,1]]
     )
-
-    # Loss options
-    use_cls_loss: bool = True  # Enable/disable CLS-CLS SimCLR loss
-    use_s3_cls_loss: bool = True  # Enable/disable S3 → CLS prediction loss
-
-    # Pooling type for spatial pooling ('mean' or 'max')
-    pool_type: str = 'max'
-
-    # Spatial matching mode for hierarchical loss
-    # 'spatial': position-wise matching with flip correspondence (same position tokens)
-    # 'global': all-to-all matching without correspondence (any token can match any)
-    spatial_match_mode: str = 'spatial'
-
-    # Use learnable mask tokens for S1/S2 instead of real patch embeddings
-    # Similar to CLS token - lets them learn abstract representations
-    use_mask_tokens: bool = True
 
 
 # ============================================================
@@ -224,7 +208,7 @@ def build_causal_mask(device: str = 'cpu', custom_mask: Optional[List[List[int]]
         [1, 0, 0, 1],  # CLS sees CLS + S3
         [1, 1, 0, 0],  # S1 sees CLS + S1
         [1, 0, 1, 0],  # S2 sees CLS + S2
-        [0, 0, 0, 1],  # S3 sees CLS + S3
+        [1, 0, 0, 1],  # S3 sees CLS + S3
     ]
     mask = build_causal_mask_from_matrix(default_matrix, device)
     _default_mask_cache[device] = mask
@@ -650,11 +634,6 @@ class VAREncoderCIFAR(nn.Module):
         # CLS token
         self.cls_token = nn.Parameter(torch.zeros(1, 1, config.dim))
 
-        # Learnable mask tokens for S1/S2 (optional, like CLS)
-        if config.use_mask_tokens:
-            self.s1_mask_token = nn.Parameter(torch.zeros(1, 1, config.dim))  # Single token, broadcast to 4
-            self.s2_mask_token = nn.Parameter(torch.zeros(1, 1, config.dim))  # Single token, broadcast to 16
-
         # Patch coordinates for RoPE
         coords = get_all_centers_cifar()  # [84, 2]
         self.register_buffer('coords', coords)
@@ -693,9 +672,6 @@ class VAREncoderCIFAR(nn.Module):
         nn.init.trunc_normal_(self.cls_token, std=0.02)
         nn.init.trunc_normal_(self.proj.weight, std=0.02)
         nn.init.zeros_(self.proj.bias)
-        if self.config.use_mask_tokens:
-            nn.init.trunc_normal_(self.s1_mask_token, std=0.02)
-            nn.init.trunc_normal_(self.s2_mask_token, std=0.02)
 
     def encode_all_scales(self, images: torch.Tensor) -> dict:
         """Encode images and return hidden states for all scales.
@@ -722,19 +698,9 @@ class VAREncoderCIFAR(nn.Module):
 
         s1_real, s2_real, s3_real = all_embeds
 
-        # Use mask tokens or real embeddings for S1/S2
-        if self.config.use_mask_tokens:
-            # Learnable mask tokens (like CLS) instead of real patches
-            s1_tokens = self.s1_mask_token.expand(B, 4, -1)   # [B, 4, dim]
-            s2_tokens = self.s2_mask_token.expand(B, 16, -1)  # [B, 16, dim]
-        else:
-            # Real patch embeddings
-            s1_tokens = s1_real
-            s2_tokens = s2_real
-
-        # Construct input: [CLS, S1, S2, S3_real]
+        # Construct input: [CLS, S1_real, S2_real, S3_real]
         cls_tokens = self.cls_token.expand(B, -1, -1)  # [B, 1, dim]
-        tokens = torch.cat([cls_tokens, s1_tokens, s2_tokens, s3_real], dim=1)  # [B, 85, dim]
+        tokens = torch.cat([cls_tokens, s1_real, s2_real, s3_real], dim=1)  # [B, 85, dim]
 
         # Transformer with causal mask
         for block in self.blocks:
@@ -765,29 +731,13 @@ class VAREncoderCIFAR(nn.Module):
         # Reshape to 2D grid
         x = x.view(B, from_grid, from_grid, D).permute(0, 3, 1, 2)  # [B, D, H, W]
 
-        # Pool down using configured pool type
+        # Pool down
         pool_size = from_grid // to_grid
-        if self.config.pool_type == 'max':
-            x = F.max_pool2d(x, kernel_size=pool_size, stride=pool_size)
-        else:  # mean
-            x = F.avg_pool2d(x, kernel_size=pool_size, stride=pool_size)  # [B, D, to_grid, to_grid]
+        x = F.avg_pool2d(x, kernel_size=pool_size, stride=pool_size)  # [B, D, to_grid, to_grid]
 
         # Reshape back
         x = x.permute(0, 2, 3, 1).view(B, to_grid * to_grid, D)  # [B, to_grid^2, D]
         return x
-
-    def global_pool(self, x: torch.Tensor) -> torch.Tensor:
-        """Pool all tokens to a single vector.
-
-        Args:
-            x: [B, N, dim] - spatial tokens
-        Returns:
-            [B, dim] - pooled representation
-        """
-        if self.config.pool_type == 'max':
-            return x.max(dim=1)[0]
-        else:  # mean
-            return x.mean(dim=1)
 
     def compute_flip_correspondence(
         self,
@@ -859,74 +809,44 @@ class VAREncoderCIFAR(nn.Module):
         # ============================================================
         # 1. CLS-CLS SimCLR Loss (global representation - spatial invariance)
         # ============================================================
-        if self.config.use_cls_loss:
-            loss_cls = self.infonce_cls(h1['cls'], h2['cls'])
-        else:
-            loss_cls = torch.tensor(0.0, device=images.device)
+        loss_cls = self.infonce_cls(h1['cls'], h2['cls'])
 
         # ============================================================
-        # 2. Cross-view Hierarchical Loss
+        # 2. Cross-view Hierarchical Loss with Flip Correspondence
         # ============================================================
+        # Since affine is shared, only flip differs between views
+        # Compute flip correspondence for each scale
+        corr_s1 = self.compute_flip_correspondence(t1['flip'], t2['flip'], grid_size=2)
+        corr_s2 = self.compute_flip_correspondence(t1['flip'], t2['flip'], grid_size=4)
+
         # S1 (2x2=4) predicts S2 (4x4=16) pooled to (2x2=4)
         # S2 (4x4=16) predicts S3 (8x8=64) pooled to (4x4=16)
 
+        # v1 coarse → v2 fine (pooled) with correspondence
         h2_s2_pooled = self.spatial_pool(h2['s2'], from_grid=4, to_grid=2)  # [B, 4, dim]
         h2_s3_pooled = self.spatial_pool(h2['s3'], from_grid=8, to_grid=4)  # [B, 16, dim]
+        loss_12_s1s2 = self.infonce_spatial_aligned(h1['s1'], h2_s2_pooled, corr_s1)
+        loss_12_s2s3 = self.infonce_spatial_aligned(h1['s2'], h2_s3_pooled, corr_s2)
+
+        # v2 coarse → v1 fine (pooled) - reverse correspondence (same as forward for flip)
+        # Note: flip correspondence is symmetric, so corr(v1→v2) == corr(v2→v1)
         h1_s2_pooled = self.spatial_pool(h1['s2'], from_grid=4, to_grid=2)  # [B, 4, dim]
         h1_s3_pooled = self.spatial_pool(h1['s3'], from_grid=8, to_grid=4)  # [B, 16, dim]
-
-        if self.config.spatial_match_mode == 'spatial':
-            # Spatial matching: position-wise with flip correspondence
-            corr_s1 = self.compute_flip_correspondence(t1['flip'], t2['flip'], grid_size=2)
-            corr_s2 = self.compute_flip_correspondence(t1['flip'], t2['flip'], grid_size=4)
-
-            loss_12_s1s2 = self.infonce_spatial_aligned(h1['s1'], h2_s2_pooled, corr_s1)
-            loss_12_s2s3 = self.infonce_spatial_aligned(h1['s2'], h2_s3_pooled, corr_s2)
-            loss_21_s1s2 = self.infonce_spatial_aligned(h2['s1'], h1_s2_pooled, corr_s1)
-            loss_21_s2s3 = self.infonce_spatial_aligned(h2['s2'], h1_s3_pooled, corr_s2)
-        else:
-            # Global matching: all-to-all without correspondence
-            loss_12_s1s2 = self.infonce_spatial(h1['s1'], h2_s2_pooled)
-            loss_12_s2s3 = self.infonce_spatial(h1['s2'], h2_s3_pooled)
-            loss_21_s1s2 = self.infonce_spatial(h2['s1'], h1_s2_pooled)
-            loss_21_s2s3 = self.infonce_spatial(h2['s2'], h1_s3_pooled)
+        loss_21_s1s2 = self.infonce_spatial_aligned(h2['s1'], h1_s2_pooled, corr_s1)
+        loss_21_s2s3 = self.infonce_spatial_aligned(h2['s2'], h1_s3_pooled, corr_s2)
 
         # loss_hier = (loss_12_s1s2 + loss_12_s2s3 + loss_21_s1s2 + loss_21_s2s3) / 4
         loss_hier = (loss_12_s1s2 + loss_12_s2s3) / 2
-
         # ============================================================
-        # 3. S3 → CLS Prediction Loss (fine → global)
+        # 3. Combined Loss
         # ============================================================
-        if self.config.use_s3_cls_loss:
-            # Pool S3 to single vector and predict the other view's CLS
-            h1_s3_global = self.global_pool(h1['s3'])  # [B, dim]
-            h2_s3_global = self.global_pool(h2['s3'])  # [B, dim]
-            # Cross-view: S3 from view1 → CLS from view2, and vice versa
-            # loss_s3_cls = (self.infonce_cls(h1_s3_global, h2['cls']) +
-            #                self.infonce_cls(h2_s3_global, h1['cls'])) / 2
-            loss_s3_cls = self.infonce_cls(h1_s3_global, h2['cls'])
-        else:
-            loss_s3_cls = torch.tensor(0.0, device=images.device)
-
-        # ============================================================
-        # 4. Combined Loss
-        # ============================================================
-        # Count active losses for weighting
-        active_losses = []
-        if self.config.use_cls_loss:
-            active_losses.append(loss_cls)
-        active_losses.append(loss_hier)  # Always active
-        if self.config.use_s3_cls_loss:
-            active_losses.append(loss_s3_cls)
-
-        # Equal weight for all active losses
-        loss = sum(active_losses) / len(active_losses)
+        # CLS loss weight: 0.5, Hierarchical loss weight: 0.5
+        loss = 0.5 * loss_cls + 0.5 * loss_hier
 
         return {
             'loss': loss,
-            'loss_cls': loss_cls.item() if self.config.use_cls_loss else 0.0,
+            'loss_cls': loss_cls.item(),
             'loss_hier': loss_hier.item(),
-            'loss_s3_cls': loss_s3_cls.item() if self.config.use_s3_cls_loss else 0.0,
             'cls': h1['cls'],
         }
 
@@ -1112,7 +1032,6 @@ def train_epoch(model, loader, optimizer, device, epoch, base_seed: Optional[int
     total_loss = 0
     total_loss_cls = 0
     total_loss_hier = 0
-    total_loss_s3_cls = 0
 
     # Set epoch-specific seed for reproducibility with diversity
     if base_seed is not None:
@@ -1143,12 +1062,10 @@ def train_epoch(model, loader, optimizer, device, epoch, base_seed: Optional[int
         total_loss += loss.item()
         total_loss_cls += output['loss_cls']
         total_loss_hier += output['loss_hier']
-        total_loss_s3_cls += output['loss_s3_cls']
         pbar.set_postfix(
             loss=f"{loss.item():.3f}",
             cls=f"{output['loss_cls']:.3f}",
-            hier=f"{output['loss_hier']:.3f}",
-            s3c=f"{output['loss_s3_cls']:.3f}"
+            hier=f"{output['loss_hier']:.3f}"
         )
 
     n = len(loader)
@@ -1156,7 +1073,6 @@ def train_epoch(model, loader, optimizer, device, epoch, base_seed: Optional[int
         'loss': total_loss / n,
         'loss_cls': total_loss_cls / n,
         'loss_hier': total_loss_hier / n,
-        'loss_s3_cls': total_loss_s3_cls / n,
     }
 
 
@@ -1530,14 +1446,13 @@ def main():
                 })
 
         knn_str = f"knn={last_knn*100:.2f}%" if knn_evaluated else f"knn={last_knn*100:.2f}% (cached)"
-        print(f"Epoch {epoch}: loss={train_stats['loss']:.4f} (cls={train_stats['loss_cls']:.3f}, hier={train_stats['loss_hier']:.3f}, s3c={train_stats['loss_s3_cls']:.3f}), test={test_loss:.4f}, {knn_str}")
+        print(f"Epoch {epoch}: loss={train_stats['loss']:.4f} (cls={train_stats['loss_cls']:.3f}, hier={train_stats['loss_hier']:.3f}), test={test_loss:.4f}, {knn_str}")
 
         if config.use_wandb:
             log_dict = {
                 'train/loss': train_stats['loss'],
                 'train/loss_cls': train_stats['loss_cls'],
                 'train/loss_hier': train_stats['loss_hier'],
-                'train/loss_s3_cls': train_stats['loss_s3_cls'],
                 'test/loss': test_loss,
                 'lr': scheduler.get_last_lr()[0],
             }
