@@ -60,14 +60,14 @@ import random
 class CIFARConfig:
     # Model
     dim: int = 256
-    depth: int = 14
+    depth: int = 6
     num_heads: int = 8
     mlp_ratio: float = 4.0
     patch_size: int = 4  # 4x4 patches for CIFAR
     drop: float = 0.0
     attn_drop: float = 0.0
     drop_path: float = 0.0
-    temperature: float = 0.07  # InfoNCE temperature
+    temperature: float = 0.4  # InfoNCE temperature
 
     # Data
     batch_size: int = 256
@@ -76,7 +76,7 @@ class CIFARConfig:
     # Training
     epochs: int = 500
     lr: float = 1e-3
-    weight_decay: float = 0.05
+    weight_decay: float = 0.005
     warmup_epochs: int = 10
 
     # Logging
@@ -107,11 +107,20 @@ class CIFARConfig:
     )
 
     # Loss options
-    use_cls_loss: bool = False  # Enable/disable CLS-CLS SimCLR loss
+    use_cls_loss: bool = True  # Enable/disable CLS-CLS SimCLR loss
     use_s3_cls_loss: bool = True  # Enable/disable S3 → CLS prediction loss
 
     # Pooling type for spatial pooling ('mean' or 'max')
-    pool_type: str = 'mean'
+    pool_type: str = 'max'
+
+    # Spatial matching mode for hierarchical loss
+    # 'spatial': position-wise matching with flip correspondence (same position tokens)
+    # 'global': all-to-all matching without correspondence (any token can match any)
+    spatial_match_mode: str = 'spatial'
+
+    # Use learnable mask tokens for S1/S2 instead of real patch embeddings
+    # Similar to CLS token - lets them learn abstract representations
+    use_mask_tokens: bool = True
 
 
 # ============================================================
@@ -641,6 +650,11 @@ class VAREncoderCIFAR(nn.Module):
         # CLS token
         self.cls_token = nn.Parameter(torch.zeros(1, 1, config.dim))
 
+        # Learnable mask tokens for S1/S2 (optional, like CLS)
+        if config.use_mask_tokens:
+            self.s1_mask_token = nn.Parameter(torch.zeros(1, 1, config.dim))  # Single token, broadcast to 4
+            self.s2_mask_token = nn.Parameter(torch.zeros(1, 1, config.dim))  # Single token, broadcast to 16
+
         # Patch coordinates for RoPE
         coords = get_all_centers_cifar()  # [84, 2]
         self.register_buffer('coords', coords)
@@ -679,6 +693,9 @@ class VAREncoderCIFAR(nn.Module):
         nn.init.trunc_normal_(self.cls_token, std=0.02)
         nn.init.trunc_normal_(self.proj.weight, std=0.02)
         nn.init.zeros_(self.proj.bias)
+        if self.config.use_mask_tokens:
+            nn.init.trunc_normal_(self.s1_mask_token, std=0.02)
+            nn.init.trunc_normal_(self.s2_mask_token, std=0.02)
 
     def encode_all_scales(self, images: torch.Tensor) -> dict:
         """Encode images and return hidden states for all scales.
@@ -705,9 +722,19 @@ class VAREncoderCIFAR(nn.Module):
 
         s1_real, s2_real, s3_real = all_embeds
 
-        # Construct input: [CLS, S1_real, S2_real, S3_real]
+        # Use mask tokens or real embeddings for S1/S2
+        if self.config.use_mask_tokens:
+            # Learnable mask tokens (like CLS) instead of real patches
+            s1_tokens = self.s1_mask_token.expand(B, 4, -1)   # [B, 4, dim]
+            s2_tokens = self.s2_mask_token.expand(B, 16, -1)  # [B, 16, dim]
+        else:
+            # Real patch embeddings
+            s1_tokens = s1_real
+            s2_tokens = s2_real
+
+        # Construct input: [CLS, S1, S2, S3_real]
         cls_tokens = self.cls_token.expand(B, -1, -1)  # [B, 1, dim]
-        tokens = torch.cat([cls_tokens, s1_real, s2_real, s3_real], dim=1)  # [B, 85, dim]
+        tokens = torch.cat([cls_tokens, s1_tokens, s2_tokens, s3_real], dim=1)  # [B, 85, dim]
 
         # Transformer with causal mask
         for block in self.blocks:
@@ -838,28 +865,31 @@ class VAREncoderCIFAR(nn.Module):
             loss_cls = torch.tensor(0.0, device=images.device)
 
         # ============================================================
-        # 2. Cross-view Hierarchical Loss with Flip Correspondence
+        # 2. Cross-view Hierarchical Loss
         # ============================================================
-        # Since affine is shared, only flip differs between views
-        # Compute flip correspondence for each scale
-        corr_s1 = self.compute_flip_correspondence(t1['flip'], t2['flip'], grid_size=2)
-        corr_s2 = self.compute_flip_correspondence(t1['flip'], t2['flip'], grid_size=4)
-
         # S1 (2x2=4) predicts S2 (4x4=16) pooled to (2x2=4)
         # S2 (4x4=16) predicts S3 (8x8=64) pooled to (4x4=16)
 
-        # v1 coarse → v2 fine (pooled) with correspondence
         h2_s2_pooled = self.spatial_pool(h2['s2'], from_grid=4, to_grid=2)  # [B, 4, dim]
         h2_s3_pooled = self.spatial_pool(h2['s3'], from_grid=8, to_grid=4)  # [B, 16, dim]
-        loss_12_s1s2 = self.infonce_spatial_aligned(h1['s1'], h2_s2_pooled, corr_s1)
-        loss_12_s2s3 = self.infonce_spatial_aligned(h1['s2'], h2_s3_pooled, corr_s2)
-
-        # v2 coarse → v1 fine (pooled) - reverse correspondence (same as forward for flip)
-        # Note: flip correspondence is symmetric, so corr(v1→v2) == corr(v2→v1)
         h1_s2_pooled = self.spatial_pool(h1['s2'], from_grid=4, to_grid=2)  # [B, 4, dim]
         h1_s3_pooled = self.spatial_pool(h1['s3'], from_grid=8, to_grid=4)  # [B, 16, dim]
-        loss_21_s1s2 = self.infonce_spatial_aligned(h2['s1'], h1_s2_pooled, corr_s1)
-        loss_21_s2s3 = self.infonce_spatial_aligned(h2['s2'], h1_s3_pooled, corr_s2)
+
+        if self.config.spatial_match_mode == 'spatial':
+            # Spatial matching: position-wise with flip correspondence
+            corr_s1 = self.compute_flip_correspondence(t1['flip'], t2['flip'], grid_size=2)
+            corr_s2 = self.compute_flip_correspondence(t1['flip'], t2['flip'], grid_size=4)
+
+            loss_12_s1s2 = self.infonce_spatial_aligned(h1['s1'], h2_s2_pooled, corr_s1)
+            loss_12_s2s3 = self.infonce_spatial_aligned(h1['s2'], h2_s3_pooled, corr_s2)
+            loss_21_s1s2 = self.infonce_spatial_aligned(h2['s1'], h1_s2_pooled, corr_s1)
+            loss_21_s2s3 = self.infonce_spatial_aligned(h2['s2'], h1_s3_pooled, corr_s2)
+        else:
+            # Global matching: all-to-all without correspondence
+            loss_12_s1s2 = self.infonce_spatial(h1['s1'], h2_s2_pooled)
+            loss_12_s2s3 = self.infonce_spatial(h1['s2'], h2_s3_pooled)
+            loss_21_s1s2 = self.infonce_spatial(h2['s1'], h1_s2_pooled)
+            loss_21_s2s3 = self.infonce_spatial(h2['s2'], h1_s3_pooled)
 
         # loss_hier = (loss_12_s1s2 + loss_12_s2s3 + loss_21_s1s2 + loss_21_s2s3) / 4
         loss_hier = (loss_12_s1s2 + loss_12_s2s3) / 2
